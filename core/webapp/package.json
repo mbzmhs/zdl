@@ -1,0 +1,17 @@
+{
+  "name": "zdownloader-web",
+  "private": true,
+  "version": "1.7.2",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "vue": "^3.4.38"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.4",
+    "vite": "^5.4.8"
+  }
+}

@@ -1,0 +1,25 @@
+# 构建产物与可执行文件
+dist/
+core/build/
+*.exe
+*.exe~
+
+# 运行时本地数据
+data/
+*.log
+*.zdl.part
+
+# 本地工具状态 / 测试产物
+.zcode/
+gui-test-screenshots/
+
+# 系统杂项
+Thumbs.db
+.DS_Store
+
+# 本地测试二进制与诊断实例数据
+testbin/
+
+# Vue 前端工程
+node_modules/
+core/webapp/dist/

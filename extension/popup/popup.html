@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="popup.css">
+  <title>ZDownloader</title>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">Z</span>
+      <span class="title">ZDownloader</span>
+    </div>
+    <label class="switch" title="启用/停用捕获">
+      <input type="checkbox" id="masterToggle">
+      <span class="track"></span>
+    </label>
+  </header>
+
+  <section class="status-row">
+    <span id="coreState" class="core-dot"></span>
+    <span id="coreText">检测核心中…</span>
+    <span id="totalSpeed" class="speed"></span>
+  </section>
+
+  <section class="quick-add">
+    <input type="text" id="quickUrl" placeholder="粘贴链接,回车快速添加" spellcheck="false">
+  </section>
+
+  <section class="sniffs">
+    <div class="sniff-head">
+      <span>本页嗅探到的媒体</span>
+      <button id="clearSniffs" class="link-btn" title="清空列表">清空</button>
+    </div>
+    <div id="sniffList" class="sniff-list"></div>
+    <div id="sniffEmpty" class="sniff-empty">播放页面中的视频或音频后,资源会出现在这里</div>
+  </section>
+
+  <footer>
+    <button id="openUI" class="foot-btn">打开管理界面</button>
+    <button id="openOptions" class="foot-btn">设置</button>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

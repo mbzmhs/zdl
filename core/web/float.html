@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<!-- 悬浮下载小窗:由 NSPanel + WKWebView 加载(见 internal/desktop/float_darwin.go)。
+     与主 UI 同源(127.0.0.1 本地服务),轮询 /api/tasks 自算总速度/任务明细;
+     右键/双击/高度自适应经 zd-float:// scheme 导航被原生侧拦截转成对应动作。
+     三种形态:完整(曲线+任务列表)/折叠(▾ 收起列表)/迷你(曲线铺满做背景,只留速度)。 -->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box;
+      -webkit-user-select: none; user-select: none; cursor: grab; }
+  html, body {
+    width: 288px; overflow: hidden;
+    background: rgba(13, 17, 24, 0.96);
+    border-radius: 10px;
+    font: 12px -apple-system, "PingFang SC", sans-serif;
+    color: #e6edf3;
+  }
+  body { position: relative; }
+  .wrap { padding: 8px 10px; }
+  .top { display: flex; gap: 6px; align-items: center; }
+  .btn { flex: none; width: 20px; text-align: center; font-size: 13px;
+         color: #8b949e; cursor: pointer; }
+  .btn:hover { color: #e6edf3; }
+  .speeds { display: flex; flex-direction: column; justify-content: center;
+            gap: 3px; flex: none; }
+  .sp { display: flex; align-items: baseline; gap: 5px; }
+  .arrow { font-size: 11px; flex: none; }
+  .arrow.dl { color: #58a6ff; }
+  .arrow.ul { color: #3fb950; }
+  .speed { font-size: 14px; font-weight: 700; color: #58a6ff; font-variant-numeric: tabular-nums; }
+  .speed.up { color: #3fb950; font-size: 13px; }
+  .unit { font-size: 10px; color: #8b949e; }
+  #chart { display: block; width: 132px; height: 36px; flex: 1; }
+  .more { position: absolute; top: 6px; right: 24px; font-size: 10px; color: #8b949e; }
+  .rows { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+  .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+          color: #dce1eb; font-size: 11px; }
+  .bar { height: 5px; border-radius: 3px; background: #393f4c; overflow: hidden; margin: 3px 0; }
+  .bar > i { display: block; height: 100%; width: 0;
+             background: linear-gradient(90deg, #4f8cff, #22d3ee); border-radius: 3px; }
+  .info { display: flex; align-items: baseline; font-size: 10px; color: #8b949e;
+          font-variant-numeric: tabular-nums; }
+  .info .sz { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .info .ts { margin-left: auto; flex: none; white-space: nowrap; }
+  .info .ts .u { color: #34d399; margin-right: 6px; }
+  .info .ts .d { color: #4f8cff; }
+  .empty { margin-top: 8px; text-align: center; color: #6e7681; font-size: 11px; }
+  /* 折叠:收起任务列表(折叠态高度由 syncHeight 自动收缩,顶边锚定不动) */
+  body.folded .rows, body.folded .empty { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <span class="btn" id="foldBtn" title="收起/展开任务列表">▾</span>
+    <div class="speeds">
+      <div class="sp"><span class="arrow dl">↓</span><span class="speed" id="dl">0</span><span class="unit" id="dlU">B/s</span></div>
+      <div class="sp"><span class="arrow ul">↑</span><span class="speed up" id="ul">0</span><span class="unit" id="ulU">B/s</span></div>
+    </div>
+    <canvas id="chart" width="264" height="72"></canvas>
+  </div>
+  <span class="more" id="more"></span>
+  <div class="rows" id="rows"></div>
+  <div class="empty" id="empty">暂无进行中的任务</div>
+</div>
+<script>
+(function () {
+  var dl = document.getElementById("dl"), ul = document.getElementById("ul");
+  var dlU = document.getElementById("dlU"), ulU = document.getElementById("ulU");
+  var rows = document.getElementById("rows"), empty = document.getElementById("empty");
+  var moreEl = document.getElementById("more"), chart = document.getElementById("chart");
+  var foldBtn = document.getElementById("foldBtn");
+
+  // 速度自适应单位(B/s → KB/s → MB/s → GB/s),数值与单位一并更新
+  function fmt(v) {
+    if (v >= 1073741824) { return [(v / 1073741824).toFixed(1), "GB/s"]; }
+    if (v >= 1048576) { return [(v / 1048576).toFixed(1), "MB/s"]; }
+    if (v >= 1024) { return [Math.round(v / 1024), "KB/s"]; }
+    return [Math.round(v), "B/s"];
+  }
+  function fmtSize(v) {
+    if (v >= 1073741824) { return (v / 1073741824).toFixed(2) + " GB"; }
+    if (v >= 1048576) { return (v / 1048576).toFixed(1) + " MB"; }
+    if (v >= 1024) { return (v / 1024).toFixed(0) + " KB"; }
+    return v + " B";
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // 速度曲线(对齐 Windows drawSpeedChart):下载蓝/上传绿,max 归一化 + 面积填充,
+  // 采样窗 120s(1s 一采样),canvas 2x 超采样抗锯齿;迷你模式铺满全面板做背景
+  var hist = [], histUp = [], HMAX = 120;
+  var folded = localStorage.getItem("zdfold") === "1";
+
+  function applyMode() {
+    document.body.classList.toggle("folded", folded);
+    foldBtn.textContent = folded ? "▸" : "▾";
+  }
+  applyMode();
+
+  function drawChart() {
+    var ctx = chart.getContext("2d");
+    var W = chart.width, H = chart.height;
+    ctx.clearRect(0, 0, W, H);
+    if (hist.length < 2) { return; }
+    var maxV = 1, i;
+    for (i = 0; i < hist.length; i++) { if (hist[i] > maxV) { maxV = hist[i]; } }
+    for (i = 0; i < histUp.length; i++) { if (histUp[i] > maxV) { maxV = histUp[i]; } }
+    function curve(arr, line, fill) {
+      ctx.beginPath();
+      for (var j = 0; j < arr.length; j++) {
+        var x = j / (HMAX - 1) * W;
+        var y = H - 2 - (arr[j] / maxV) * (H - 6);
+        if (j) { ctx.lineTo(x, y); } else { ctx.moveTo(x, y); }
+      }
+      ctx.strokeStyle = line;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.lineTo((arr.length - 1) / (HMAX - 1) * W, H);
+      ctx.lineTo(0, H);
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+    }
+    curve(histUp, "#3fb950", "rgba(63,185,80,.14)");
+    curve(hist, "#58a6ff", "rgba(88,166,255,.22)");
+  }
+
+  // 高度自适应(Windows floatH=0 随行数语义):渲染后按实际内容高度上报,
+  // 原生侧顶边锚定调高。仅在变化时上报,避免导航风暴。
+  // 高度必须与内容精确等高:多报的部分是透明但可点击的区域(会挡住下层窗口)。
+  var lastH = 0;
+  function syncHeight() {
+    var h = Math.ceil(document.querySelector(".wrap").getBoundingClientRect().height);
+    if (h !== lastH) {
+      lastH = h;
+      window.location.href = "zd-float://h?" + h;
+    }
+  }
+
+  function tick() {
+    fetch("/api/tasks", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (d) {
+      var tasks = Array.isArray(d) ? d : (d.tasks || []), speed = 0, up = 0, act = [];
+      for (var i = 0; i < tasks.length; i++) {
+        var t = tasks[i];
+        if (t.status === "running") { speed += t.speed || 0; up += t.upSpeed || 0; }
+        else if (t.status === "seeding") { up += t.upSpeed || t.speed || 0; }
+        if (t.status === "running" && t.size > 0) {
+          act.push({
+            name: t.filename || t.url || "未命名",
+            pct: Math.min(100, t.downloaded / t.size * 100),
+            done: t.downloaded, size: t.size,
+            speed: t.speed || 0, upSpeed: t.upSpeed || 0
+          });
+        }
+      }
+      var dlv = fmt(speed), ulv = fmt(up);
+      dl.textContent = dlv[0]; dlU.textContent = dlv[1];
+      ul.textContent = ulv[0]; ulU.textContent = ulv[1];
+      hist.push(speed); histUp.push(up);
+      if (hist.length > HMAX) { hist.shift(); histUp.shift(); }
+      drawChart();
+
+      moreEl.textContent = act.length > 3 ? "+" + (act.length - 3) : "";
+      empty.style.display = act.length ? "none" : "block";
+      rows.style.display = act.length ? "flex" : "none";
+      var html = "";
+      for (var j = 0; j < act.length && j < 3; j++) {
+        var a = act[j];
+        var ts = '<span class="d">' + fmt(a.speed)[0] + " " + fmt(a.speed)[1] + " ↓</span>";
+        if (a.upSpeed > 0) {
+          ts = '<span class="u">' + fmt(a.upSpeed)[0] + " " + fmt(a.upSpeed)[1] + " ↑</span>" + ts;
+        }
+        html += '<div class="row"><div class="name" title="' + esc(a.name) + '">' + esc(a.name) +
+                '</div><div class="bar"><i style="width:' + a.pct.toFixed(1) +
+                '%"></i></div><div class="info"><span class="sz">' + fmtSize(a.done) + " / " +
+                fmtSize(a.size) + '</span><span class="ts">' + ts + "</span></div></div>";
+      }
+      rows.innerHTML = html;
+      syncHeight();
+    }).catch(function () {});
+  }
+  setInterval(tick, 1000);
+  tick();
+
+  // 折叠/迷你切换(localStorage 记忆;按钮拦截冒泡,不触发拖拽/双击)
+  function bindBtn(el, fn) {
+    ["mousedown", "mouseup", "mousemove", "dblclick", "contextmenu"].forEach(function (ev) {
+      el.addEventListener(ev, function (e) { e.stopPropagation(); });
+    });
+    el.addEventListener("click", function (e) {
+      e.stopPropagation();
+      fn();
+    });
+  }
+  bindBtn(foldBtn, function () {
+    folded = !folded;
+    localStorage.setItem("zdfold", folded ? "1" : "0");
+    applyMode();
+    syncHeight();
+  });
+
+  // 双击唤起主窗;右键弹菜单——经自定义 scheme 导航被原生侧拦截(WKWebView 无桥)
+  document.addEventListener("dblclick", function () {
+    window.location.href = "zd-float://open";
+  });
+  document.addEventListener("contextmenu", function (e) {
+    e.preventDefault();
+    // 携带光标 client 坐标,原生侧换算屏幕坐标让菜单弹在光标处
+    window.location.href = "zd-float://menu?x=" + Math.round(e.clientX) + "&y=" + Math.round(e.clientY);
+  });
+
+  // 拖拽移动:JS mousemove 持续上报位移,原生侧 setFrameOrigin
+  // (WKWebView 自消费鼠标事件,movableByWindowBackground 对它无效)。
+  // screenX/Y 的差值不受窗口自身移动影响;>4px 才判定拖拽,不干扰双击。
+  var drag = null;
+  var bodyEl = document.body;
+  document.addEventListener("mousedown", function (e) {
+    if (e.button !== 0) { return; }
+    drag = { x: e.screenX, y: e.screenY, moved: false };
+  });
+  document.addEventListener("mousemove", function (e) {
+    if (!drag) { return; }
+    var dx = e.screenX - drag.x, dy = e.screenY - drag.y;
+    if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 4) { return; }
+    drag.moved = true;
+    drag.x = e.screenX; drag.y = e.screenY;
+    bodyEl.style.cursor = "grabbing";
+    window.webkit.messageHandlers.zdfloat.postMessage({ act: "drag", dx: dx, dy: dy });
+  });
+  document.addEventListener("mouseup", function () {
+    if (drag && drag.moved) {
+      bodyEl.style.cursor = "";
+      window.webkit.messageHandlers.zdfloat.postMessage({ act: "drag", dx: 0, dy: 0, end: true });
+    }
+    drag = null;
+  });
+})();
+</script>
+</body>
+</html>
