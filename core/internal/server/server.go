@@ -27,7 +27,7 @@ import (
 	"zdownloader/internal/rss"
 )
 
-const Version = "1.7.2"
+const Version = "1.7.3"
 
 type Server struct {
 	mgr    *engine.Manager

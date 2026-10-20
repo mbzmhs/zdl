@@ -51,3 +51,6 @@ func quitAssist() {}
 // registerSystemShutdownObserver Linux 无 NSWorkspace 关机通知占位(进程退出
 // 由 SIGTERM/SIGHUP 驱动,systemd 关机时经登录会话送达)。
 func registerSystemShutdownObserver() {}
+
+// setActivationPolicy Linux 无 Dock/激活策略概念,空实现(跨平台 OnStartup 引用)。
+func setActivationPolicy(regular bool) {}

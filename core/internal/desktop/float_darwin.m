@@ -259,3 +259,15 @@ void zdFloatCloseC(void) {
         }
     });
 }
+
+// zdAppSetActivationPolicyC 切换应用激活策略:regular=1 显示 Dock 图标,
+// regular=0 切到 Accessory(无 Dock 图标、不出现在应用切换器,窗口/面板/托盘照常)。
+// 异步派发主线程,按调用顺序生效——hideToTray 先 orderOut 再切 Accessory,
+// showToScreen 先切 Regular 再上屏,窗口成 key 之前图标已就位。
+void zdAppSetActivationPolicyC(int regular) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp setActivationPolicy:regular
+            ? NSApplicationActivationPolicyRegular
+            : NSApplicationActivationPolicyAccessory];
+    });
+}

@@ -14,6 +14,12 @@ extern void zdFloatMenuExit(void);
 // 系统即将关机/重启通知到达时的回调(主线程;Go 侧 //export 生成)
 extern void zdAppOnSystemShutdown(void);
 
+// 切换 NSApplication 激活策略(主线程,异步按调用顺序生效):
+// regular=1 → NSApplicationActivationPolicyRegular,显示 Dock 图标并出现在应用切换器;
+// regular=0 → NSApplicationActivationPolicyAccessory,无 Dock 图标、不出现在应用切换器,
+// 但窗口/面板/托盘照常工作(隐藏到托盘时用——关闭后不残留 Dock 图标,唤起时再出现)。
+void zdAppSetActivationPolicyC(int regular);
+
 // 主线程创建面板并加载 url(x/y/w/h = 记忆位置,w/h 为 0 用默认;posSet=是否记忆有效)
 void zdFloatCreateC(const char *url, int x, int y, int w, int h, int posSet);
 

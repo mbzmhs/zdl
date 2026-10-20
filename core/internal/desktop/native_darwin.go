@@ -41,17 +41,32 @@ func zdAppOnSystemShutdown() {
 	}
 }
 
+// setActivationPolicy 切换 NSApplication 激活策略:regular=true 显示 Dock 图标并
+// 出现在应用切换器(显示界面时);false 为 Accessory——无 Dock 图标、不出现在应用
+// 切换器,但窗口/面板/托盘照常工作(隐藏到托盘时)。异步派发主线程,按调用顺序生效。
+func setActivationPolicy(regular bool) {
+	if regular {
+		C.zdAppSetActivationPolicyC(1)
+	} else {
+		C.zdAppSetActivationPolicyC(0)
+	}
+}
+
 // macOS 托盘隐藏 = WindowHide(orderOut):NSStatusItem 托盘(bt.184)承担唤起
 // 职责;此前 WindowMinimise 缩 Dock 是无托盘期的过渡态。唤起侧 Unminimise+Show
 // 对 orderOut 窗同样有效(StartHidden 实测)。
+// orderOut 只把窗口移出屏幕,应用仍是 Regular——Dock 图标残留且 Cmd+Q/X 无法退出。
+// 隐藏到托盘时再切 Accessory:Dock 图标随之消失,唤起时切回 Regular 再出现。
 func (a *App) hideToTray() {
 	if a.wctx != nil {
 		wruntime.WindowHide(a.wctx)
+		setActivationPolicy(false)
 	}
 }
 
 func (a *App) showToScreen() {
 	if a.wctx != nil {
+		setActivationPolicy(true) // 先回 Regular 让 Dock 图标就位,再上屏成 key
 		wruntime.WindowUnminimise(a.wctx)
 		wruntime.WindowShow(a.wctx)
 	}

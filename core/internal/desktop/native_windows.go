@@ -454,6 +454,9 @@ func quitAssist() {}
 // Win32 会话结束消息(WM_QUERYENDSESSION/WM_ENDSESSION)由 Wails 主循环原生处理。
 func registerSystemShutdownObserver() {}
 
+// setActivationPolicy Windows 无 Dock/激活策略概念,空实现(跨平台 OnStartup 引用)。
+func setActivationPolicy(regular bool) {}
+
 func NewFloatWindow(baseURL string, onShow, onSettings, onExit func()) *FloatWindow {
 	return &FloatWindow{baseURL: baseURL, onShow: onShow, onSettings: onSettings, onExit: onExit}
 }
