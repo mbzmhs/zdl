@@ -276,6 +276,12 @@ func (a *App) Run(title string, width, height int) error {
 				wruntime.WindowSetPosition(ctx, a.winX, a.winY)
 				wruntime.WindowSetSize(ctx, a.winW, a.winH)
 			}
+			// 静默自启(-no-browser):窗口从未上屏,Dock 不应出现图标(与"关闭即隐藏"
+			// 同一终态)。Wails 在 applicationWillFinishLaunching 硬置 Regular 并有
+			// 短暂 Dock 图标闪现,此处切回 Accessory;显窗时 showToScreen 再切回。
+			if a.startHidden {
+				setActivationPolicy(false)
+			}
 			a.hasShown = !a.startHidden
 			go a.pollWinPos()
 		},
