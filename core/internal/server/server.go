@@ -1261,9 +1261,8 @@ func statusFor(err error) int {
 		return http.StatusNotFound
 	}
 	if errors.Is(err, engine.ErrStreamNotWanted) || errors.Is(err, engine.ErrStreamNoSession) ||
-		errors.Is(err, engine.ErrStreamV2Deferred) || errors.Is(err, engine.ErrStreamCompleted) ||
-		errors.Is(err, engine.ErrStreamStale) {
-		return http.StatusConflict // 前置条件不满足:需扩选/会话未运行/文件不支持/已完成/旧代次
+		errors.Is(err, engine.ErrStreamV2Deferred) || errors.Is(err, engine.ErrStreamStale) {
+		return http.StatusConflict // 前置条件不满足:需扩选/会话未运行/文件不支持/旧代次
 	}
 	return http.StatusBadRequest
 }

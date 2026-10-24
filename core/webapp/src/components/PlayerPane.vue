@@ -36,7 +36,6 @@ const buffering = ref(false);  // video waiting/stalled
 const stat = ref(null);        // /stream/status 快照
 const videoEl = ref(null);     // 播放头位置(timeupdate→分块图标记线)
 const bufCv = ref(null);       // 分块位图画布
-const pendingSeek = ref(false); // seeking→seeked 过渡:红线贴 serveStart 而非均摊
 let pollTimer = 0;
 let cleaning = false; // 收尾单次保护(须先于下方 p-watch 声明:immediate 回调同步执行)
 
@@ -232,52 +231,96 @@ function drawBuf() {
       ctx.fillRect(x, 1, 1, h - 6);
     }
   }
-  // 头/尾元数据 pin 区间:底部橙色下划线(尚未完成的分块更值得关注)
+  // 头/尾元数据 pin 区间:底部橙色下划线。最小 6px 可视宽度——精化后的
+  // pin 可能只覆盖 1 个 piece(如 faststart 的大 moov 恰好落进首片),
+  // 长进度条上不足 1px,不设下限就"看不见元数据位置"(实测 2.09MB 头
+  // moov 文件),锚定区间起点画
   const pin = (a, b) => {
     if (!(a >= 0) || !(b >= a)) return;
     const i0 = Math.max(0, a - s.firstPiece), i1 = Math.min(n - 1, b - s.firstPiece);
     if (i1 < i0) return;
     ctx.fillStyle = "#f59e0b";
-    ctx.fillRect(xOf(i0), h - 4, Math.max(1, xOf(i1 + 1) - xOf(i0)), 2.5);
+    ctx.fillRect(xOf(i0), h - 4, Math.max(6, xOf(i1 + 1) - xOf(i0)), 2.5);
   };
   pin(s.pinHeadFirst, s.pinHeadLast);
   pin(s.pinTailFirst, s.pinTailLast);
-  // 下载游标(引擎窗口起点):白色细线
-  if (s.cursorPiece >= 0) {
-    const c = s.cursorPiece - s.firstPiece;
-    if (c >= 0 && c < n) {
-      ctx.fillStyle = "rgba(255,255,255,0.9)";
-      ctx.fillRect(Math.min(w - 1, xOf(c)), 0, 1.5, h - 3);
-    }
-  }
   // 播放头(视频时间→字节):优先用 buffered 时间区间与引擎服务字节区间对齐
   // 做内插(浏览器解码过 moov/cues 索引,局部码率近似恒定,VBR 下远准于全片
-  // 均摊);拿不到服务区间时回退全片均摊(近似)。
+  // 均摊);拿不到服务区间时回退全片均摊(近似)。内插锚定"内容起点"
+  // (metaEnd,探测出的 moov/EBML 区结束):头部索引区占字节但播放时间为
+  // 零,不锚定会让红线系统性落后一个头 moov 的量(实测 2.09MB 头 moov)。
+  // 播放头(视频时间→字节):优先用引擎下发的容器索引"时间→字节"表
+  // (stts/stsc/stco 或 Cues——与播放器 seek 用的是同一份索引)二分查找,
+  // 精确换算。表缺失(探测未完成/不支持的容器)依次退回:buffered 时间
+  // 区间×服务字节区间内插(估算,VBR/推送-解析速率差下会偏)→ 服务区间
+  // 锚点(拖动落点,播放前进后不动)→ 全片均摊(最粗糙)
+  const seekTableOff = (tab, t) => {
+    if (!tab || !tab.length || !(t >= 0)) return -1;
+    if (t <= tab[0][0]) return tab[0][1];
+    const last = tab[tab.length - 1];
+    if (t >= last[0]) return last[1];
+    let lo = 0, hi = tab.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (tab[mid][0] <= t) lo = mid; else hi = mid;
+    }
+    const [t0, o0] = tab[lo], [t1, o1] = tab[hi];
+    return t1 > t0 ? o0 + (o1 - o0) * (t - t0) / (t1 - t0) : o1;
+  };
   const vd = videoEl.value;
   if (vd && vd.duration > 0 && s.size > 0) {
     let fileOff = -1;
+    let src = "摊";
     const b = vd.buffered;
-    if (s.serveEnd >= s.serveStart && (s.serveStart > 0 || s.serveEnd > 0)) {
+    const anchor = Math.max(s.serveStart || 0, s.metaEnd || 0);
+    if ((fileOff = seekTableOff(s.seek, vd.currentTime)) >= 0) {
+      src = "表";
+    } else if (s.serveEnd >= anchor && (s.serveStart > 0 || s.serveEnd > 0 || s.metaEnd > 0)) {
       for (let i = 0; i < b.length; i++) {
         if (vd.currentTime >= b.start(i) - 0.05 && vd.currentTime <= b.end(i) + 0.05) {
           const span = b.end(i) - b.start(i);
           const t = span > 0 ? Math.min(1, Math.max(0, (vd.currentTime - b.start(i)) / span)) : 0;
-          fileOff = s.serveStart + t * (s.serveEnd - s.serveStart);
+          fileOff = anchor + t * (s.serveEnd - anchor);
+          src = "插";
           break;
         }
       }
     }
-    // seek 过渡态(新位置尚无缓冲区间):serveStart 即 seek Range 的落点字节,
-    // 红线贴它比全片均摊(拖动中错位的来源)准得多
-    if (fileOff < 0 && pendingSeek.value && s.serveEnd >= s.serveStart && (s.serveStart > 0 || s.serveEnd > 0)) {
-      fileOff = s.serveStart;
+    // 无表也无匹配缓冲区间:锚点=当前播放会话落点(连接 Range 起点)。
+    // 均摊会把 VBR 文件映射到错误字节(实测拖到 59% 时均摊落到未下载的
+    // 365MB 空白区,而真实落点=serveStart 378MB)
+    if (fileOff < 0 && s.serveEnd >= anchor && (s.serveStart > 0 || s.serveEnd > 0 || s.metaEnd > 0)) {
+      fileOff = anchor;
+      src = "锚";
     }
     if (fileOff < 0) fileOff = vd.currentTime / vd.duration * s.size;
-    const globalOff = (s.fileOffset || 0) + fileOff;
-    const idx = Math.floor(globalOff / s.pieceLen) - s.firstPiece;
+    // 钳制仅作用于估算来源(插/锚/摊):估算可能高估到未下载空洞,
+    // 钳到自锚点起连续已完成的最远 piece 边界。表换算是精确值不钳——
+    // 拖动到未下载区缓冲是合法场景,播放头就应显示在那里(实测:拖到片尾
+    // 被钳回下载前沿,红线错位)
+    const doneBit = i => (raw.charCodeAt(i >> 3) >> (7 - (i & 7))) & 1;
+    const aIdx = Math.max(0, Math.floor(((s.fileOffset || 0) + anchor) / s.pieceLen) - s.firstPiece);
+    let lastDone = -1;
+    for (let i = aIdx; i < n; i++) {
+      if (doneBit(i)) lastDone = i; else break;
+    }
+    let idx = Math.floor(((s.fileOffset || 0) + fileOff) / s.pieceLen) - s.firstPiece;
+    if (src !== "表" && lastDone >= 0 && idx > lastDone) idx = lastDone;
     if (idx >= 0 && idx < n) {
       ctx.fillStyle = "#ef4444";
       ctx.fillRect(Math.min(w - 2, xOf(idx)), 0, 2, h - 3);
+    }
+  }
+  // 下载游标(引擎窗口起点):只画下半段并最后绘制——红线全高,重叠时
+  // 上半段是红线、下半段是白线(带深色描边),两条互不遮挡始终可见
+  if (s.cursorPiece >= 0) {
+    const c = s.cursorPiece - s.firstPiece;
+    if (c >= 0 && c < n) {
+      const x = Math.min(w - 1, xOf(c));
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(x - 1.25, h / 2, 3.5, h / 2 - 3);
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.fillRect(x - 0.25, h / 2, 1.5, h / 2 - 3);
     }
   }
 }
@@ -291,8 +334,8 @@ const onTimeUpdate = () => {
   const vd = videoEl.value;
   if (vd && vd.duration > 0 && vd.currentTime / vd.duration > 0.9) warmNext();
 };
-const onSeeking = () => { pendingSeek.value = true; tick(); };
-const onSeeked = () => { pendingSeek.value = false; buffering.value = false; drawBuf(); };
+const onSeeking = () => tick(); // seek Range 即刻到达,立刻刷新状态拿新锚点
+const onSeeked = () => { buffering.value = false; drawBuf(); };
 
 const bufStat = computed(() => {
   // 连接中:status 还是上一集会话的数据,不展示(避免"已缓冲"短暂变成旧集)
@@ -439,8 +482,8 @@ onBeforeUnmount(() => {
           <span><i class="lg lg-cur"></i>下载游标</span>
           <span><i class="lg lg-play"></i>播放头</span>
         </div>
-        <span class="dim">{{ bufStat ? `已缓冲 ${bufStat.pct.toFixed(0)}%(分块 ${bufStat.done}/${bufStat.total})` : "读取缓冲状态…"
-          }}<template v-if="stat"> · {{ fmtBytes(stat.size || 0) }} · <span class="pl-speed" :class="{ low: lowSpeed }">↓ {{ fmtBytes(stat.speed || 0) }}/s<template v-if="lowSpeed">(低于码率 {{ fmtBytes(stat.bitrate) }}/s,可能反复缓冲)</template></span></template></span>
+          <span class="dim">{{ bufStat ? `已缓冲 ${bufStat.pct.toFixed(0)}%(分块 ${bufStat.done}/${bufStat.total})` : "读取缓冲状态…"
+            }}<template v-if="stat"> · {{ fmtBytes(stat.size || 0) }} · <span class="pl-speed" :class="{ low: lowSpeed }">↓ {{ fmtBytes(stat.speed || 0) }}/s<template v-if="lowSpeed">(低于码率 {{ fmtBytes(stat.bitrate) }}/s,可能反复缓冲)</template></span></template></span>
       </div>
     </div>
   </Overlay>

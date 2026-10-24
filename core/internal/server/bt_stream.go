@@ -104,7 +104,11 @@ func (s *Server) handleBTStream(w http.ResponseWriter, r *http.Request) {
 	// 最新连接拥有游标权:本请求的起点即当前播放头(seek 即时重排窗口)。
 	// 仅开放式 Range(到文件尾)/无 Range 视为播放语义;有界小 Range 是
 	// 探测/moov 回读,不抢游标(否则浏览器回读文件头会把主播放流饿死在头部)
-	s.mgr.BTStreamPos(id, seq, start, end >= info.Size-1)
+	// 后缀 Range(bytes=-N,探测时长/读文件尾)不视为播放语义:其 end 恒为文件尾,
+	// 按旧规则会抢走游标把下载优先级拽到文件尾——播放头区域被饿死,
+	// 25s 超时断流后浏览器误判 EOS 跳到片尾(实测 17% 缓冲即“播放结束”)
+	suffix := strings.HasPrefix(strings.TrimSpace(r.Header.Get("Range")), "bytes=-")
+	s.mgr.BTStreamPos(id, seq, start, end >= info.Size-1 && !suffix)
 
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set("Accept-Ranges", "bytes")

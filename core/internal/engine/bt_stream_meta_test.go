@@ -8,10 +8,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,8 +158,8 @@ func beF32(v float32) []byte {
 func TestMKVWalkHead(t *testing.T) {
 	ebml := mkvEl(mkvIDEbmlHeader, []byte{0x42, 0x86, 0x81, 0x01})
 	seek := mkvEl(mkvIDSeekHead, make([]byte, 48))
-	scale := mkvEl(mkvIDTimeScale, beU32(1000000))          // 默认 1ms 单位
-	dur := mkvEl(mkvIDDuration, beF32(100000))              // 100000 单位 = 100s
+	scale := mkvEl(mkvIDTimeScale, beU32(1000000)) // 默认 1ms 单位
+	dur := mkvEl(mkvIDDuration, beF32(100000))     // 100000 单位 = 100s
 	info := mkvEl(mkvIDInfo, append(append([]byte{}, scale...), dur...))
 	tracks := mkvEl(mkvIDTracks, make([]byte, 64))
 	cluster := mkvEl(mkvIDCluster, make([]byte, 128))
@@ -227,10 +229,16 @@ func TestMKVCuesOffset(t *testing.T) {
 func buildMP4MoovAtEnd() (content []byte, mdatEnd int64) {
 	ftyp := mp4Atom("ftyp", bytes.Repeat([]byte{1}, 16)) // 24B
 	mdat := mp4Atom("mdat", make([]byte, 512<<10))       // 8 + 512KB
-	moovBody := append(mp4Mvhd(200, false), bytes.Repeat([]byte{7}, (1<<20)+(400<<10))...)
+	base := int64(len(ftyp) + len(mdat))                 // moov 起点(= mdatEnd)
+	// 最小视频轨(stts/stsc/stco):供探测构建“时间→字节”定位表
+	trak := mp4MkTrak("vide", 1000,
+		mp4Stts(2, 500), // 3 chunk × 1 样本 × 0.5s
+		mp4Stsc(1, 1),
+		mp4Stco(uint32(base), uint32(base+500), uint32(base+1000)))
+	moovBody := append(append(mp4Mvhd(200, false), trak...), bytes.Repeat([]byte{7}, (1<<20)+(400<<10))...)
 	moov := mp4Atom("moov", moovBody) // ≈ 1.4MB
 	content = concat(ftyp, mdat, moov)
-	return content, int64(len(ftyp) + len(mdat))
+	return content, base
 }
 
 func TestBTStreamMetaProbe(t *testing.T) {
@@ -300,10 +308,15 @@ func TestBTStreamMetaProbe(t *testing.T) {
 			t.Fatal(err)
 		}
 		if st.PinHeadFirst == 0 && st.PinHeadLast == 0 && st.PinTailFirst == wantTailFirst &&
-			st.Bitrate > 0 && st.Ahead == wantAhead {
+			st.Bitrate > 0 && st.Ahead == wantAhead && st.MetaEnd == 24 &&
+			len(st.Seek) >= 3 && st.Seek[0][1] == float64(mdatEnd) {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	// 内容起点 = mdat 起点:本样本 ftyp 24B 后即 mdat(moov 在尾)
+	if st.MetaEnd != 24 {
+		t.Fatalf("内容起点应为 mdat 起点 24(播放头内插锚),得到 %d", st.MetaEnd)
 	}
 	if st == nil || st.PinTailFirst != wantTailFirst || st.PinTailLast != wantTailLast {
 		t.Fatalf("尾 pin 应精化到 [%d,%d](moov 起点),得到 [%d,%d]",
@@ -311,6 +324,11 @@ func TestBTStreamMetaProbe(t *testing.T) {
 	}
 	if st.PinHeadLast != 0 {
 		t.Fatalf("头 pin 应精化到 piece 0(mdat 起点),得到 %d", st.PinHeadLast)
+	}
+	// 序列化回归:pinHeadFirst=0 不得被 omitempty 丢弃——单文件种子的头部
+	// pin 恒自 piece 0 起,零值字段被丢前端就永远画不出头部 pin(实测教训)
+	if jb, jerr := json.Marshal(st); jerr != nil || !strings.Contains(string(jb), `"pinHeadFirst":0`) {
+		t.Fatalf("status JSON 应包含 pinHeadFirst:0,err=%v", jerr)
 	}
 	if st.Bitrate <= 0 || math.Abs(st.Bitrate-float64(len(content))/200) > float64(len(content))/200*0.02 {
 		t.Fatalf("码率应 ≈ %d/200 B/s,得到 %v", len(content), st.Bitrate)
@@ -580,4 +598,85 @@ func TestBTStreamEpochGuard(t *testing.T) {
 		}
 		waitForStatus(t, m, id, StatusCompleted, 10*time.Second)
 	}
+}
+
+// ---------- 时间→字节定位表 ----------
+
+func be4(v uint32) []byte {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], v)
+	return b[:]
+}
+
+func mp4MkTrak(handler string, ts uint32, sttsBody, stscBody, stcoBody []byte) []byte {
+	mdhd := make([]byte, 20)
+	binary.BigEndian.PutUint32(mdhd[12:16], ts)
+	hdlr := make([]byte, 24)
+	copy(hdlr[8:12], handler)
+	stbl := concat(mp4Atom("stts", sttsBody), mp4Atom("stsc", stscBody), mp4Atom("stco", stcoBody))
+	mdia := mp4Atom("mdia", concat(mp4Atom("mdhd", mdhd), mp4Atom("hdlr", hdlr), mp4Atom("minf", mp4Atom("stbl", stbl))))
+	return mp4Atom("trak", mdia)
+}
+
+func mp4Stts(entries ...uint32) []byte { // (count, delta) 对
+	b := concat(be4(0), be4(uint32(len(entries)/2)))
+	for _, v := range entries {
+		b = concat(b, be4(v))
+	}
+	return b
+}
+
+func mp4Stsc(first, n uint32) []byte {
+	return concat(be4(0), be4(1), be4(first), be4(n), be4(1))
+}
+
+func mp4Stco(offs ...uint32) []byte {
+	b := concat(be4(0), be4(uint32(len(offs))))
+	for _, v := range offs {
+		b = concat(b, be4(v))
+	}
+	return b
+}
+
+func TestMP4SeekPoints(t *testing.T) {
+	// 音轨在前、视频轨在后:应选视频轨(其 stco 偏移 1000/2000/3000)
+	video := mp4MkTrak("vide", 1000,
+		mp4Stts(2, 500), // 2 样本 × 0.5s
+		mp4Stsc(1, 1),   // 每 chunk 1 样本
+		mp4Stco(1000, 2000, 3000))
+	audio := mp4MkTrak("soun", 48000,
+		mp4Stts(1, 1000), mp4Stsc(1, 1), mp4Stco(9000, 9500, 9900))
+	moovBody := concat(mp4Mvhd(100, false), audio, video)
+	pts := mp4BuildSeekPoints(moovBody)
+	if len(pts) != 3 {
+		t.Fatalf("应得 3 个点,得到 %d(%v)", len(pts), pts)
+	}
+	want := []seekPoint{{0, 1000}, {0.5, 2000}, {1.0, 3000}}
+	for i, w := range want {
+		if math.Abs(pts[i].t-w.t) > 0.001 || pts[i].off != w.off {
+			t.Fatalf("点 %d 应为 %+v,得到 %+v", i, w, pts[i])
+		}
+	}
+}
+
+func TestMKVSeekPoints(t *testing.T) {
+	cue := func(tm, pos uint64) []byte {
+		return mkvEl(0xBB, concat(
+			mkvEl(0xB3, beU64test(tm)),
+			mkvEl(0xE7, mkvEl(0xF1, beU64test(pos)))))
+	}
+	cues := concat(cue(0, 100), cue(1000, 5000)) // 1000 × 1e6ns = 1s
+	pts := mkvBuildSeekPoints(cues, 50, 1e6)
+	if len(pts) != 2 {
+		t.Fatalf("应得 2 个点,得到 %d", len(pts))
+	}
+	if pts[0].t != 0 || pts[0].off != 150 || math.Abs(pts[1].t-1) > 1e-9 || pts[1].off != 5050 {
+		t.Fatalf("点位不符: %+v", pts)
+	}
+}
+
+func beU64test(v uint64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], v)
+	return b[:]
 }

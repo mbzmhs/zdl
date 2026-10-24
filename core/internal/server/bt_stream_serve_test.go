@@ -182,9 +182,30 @@ func TestHandleBTStreamServe(t *testing.T) {
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(mid, content[300<<10:300<<10+128<<10]) {
 		t.Fatalf("中段 Range 异常: status=%d body=%s", resp.StatusCode, mid)
 	}
-	// 后缀 Range(探测时长/索引):内容比对
+	// 开放式 Range(播放语义):应拨动游标
+	resp, open := fetch(streamURL, "bytes=0-")
+	if resp.StatusCode != http.StatusPartialContent || len(open) == 0 {
+		t.Fatalf("开放式 Range 异常: status=%d", resp.StatusCode)
+	}
+	cursor := func() int {
+		c, err := http.Get(ts.URL + "/api/tasks/" + id + "/stream/status")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st struct {
+			CursorPiece int `json:"cursorPiece"`
+		}
+		_ = json.NewDecoder(c.Body).Decode(&st)
+		c.Body.Close()
+		return st.CursorPiece
+	}
+	// 后缀 Range(探测时长/索引):内容比对 + 不得抢走游标
+	before := cursor()
 	resp, tail := fetch(streamURL, "bytes=-16384")
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(tail, content[len(content)-16384:]) {
 		t.Fatalf("后缀 Range 异常: status=%d len=%d", resp.StatusCode, len(tail))
+	}
+	if after := cursor(); after != before {
+		t.Fatalf("后缀 Range 不得抢走游标, %d → %d", before, after)
 	}
 }

@@ -206,14 +206,17 @@ const (
 
 // mkvHeadResult MKV 头部走查结论。
 type mkvHeadResult struct {
-	headEnd int64   // 首个 Cluster 起点(头元数据区结束;0 = 未探得)
-	durSec  float64 // Segment>Info 时长(>0 = 解析到)
+	headEnd   int64   // 首个 Cluster 起点(头元数据区结束;0 = 未探得)
+	durSec    float64 // Segment>Info 时长(>0 = 解析到)
+	segDataOff int64  // Segment 数据区起点(头后;Cues 的 ClusterPosition 相对它)
+	timeScale float64 // Info>TimecodeScale(纳秒/单位;默认 1e6)
 }
 
 // mkvWalkHead 走查 EBML 头 → Segment → 其一级子元素,直到首个 Cluster。
 // headEnd 超出 head 缓冲(头元数据大于 1MB)时放弃(返回 0,维持默认 pin)。
 func mkvWalkHead(head []byte, size int64) mkvHeadResult {
 	var r mkvHeadResult
+	r.timeScale = 1e6
 	// EBML 头(可含 Void 等,直接按元素跳过)
 	off := int64(0)
 	id, n, ok := mkvElementID(head[off:])
@@ -244,6 +247,7 @@ func mkvWalkHead(head []byte, size int64) mkvHeadResult {
 		return r
 	}
 	off += int64(sn)
+	r.segDataOff = off // Cues 的 ClusterPosition 相对 Segment 数据区起点
 	if !unk {
 		if end := off + int64(sz); end < segEnd {
 			segEnd = end
@@ -275,18 +279,18 @@ func mkvWalkHead(head []byte, size int64) mkvHeadResult {
 			return r
 		}
 		if id == mkvIDInfo && body+int64(sz) <= int64(len(head)) {
-			r.durSec = mkvInfoSeconds(head[body : body+int64(sz)])
+			r.durSec, r.timeScale = mkvInfoFields(head[body : body+int64(sz)])
 		}
 		off = body + int64(sz)
 	}
 	return r
 }
 
-// mkvInfoSeconds 解析 Segment>Info 的时长:Duration(浮点)× TimecodeScale
-// (纳秒/单位,默认 1e6)。
-func mkvInfoSeconds(info []byte) float64 {
-	scale := float64(1e6)
-	dur := -1.0
+// mkvInfoFields 解析 Segment>Info 的时长与 TimecodeScale(纳秒/单位,
+// 默认 1e6)。
+func mkvInfoFields(info []byte) (durSec, scale float64) {
+	scale = 1e6
+	var dur float64 = -1.0
 	off := 0
 	for off+2 <= len(info) {
 		id, n, ok := mkvElementID(info[off:])
@@ -325,9 +329,103 @@ func mkvInfoSeconds(info []byte) float64 {
 		off = bend
 	}
 	if dur <= 0 {
-		return 0
+		return 0, scale
 	}
-	return dur * scale / 1e9
+	return dur * scale / 1e9, scale
+}
+
+// mkvBuildSeekPoints 解析 Cues 元素(CuePoint: CueTime + CueTrackPositions>
+// CueClusterPosition)构建时间→字节表。segDataOff 为 Segment 数据区起点
+//(ClusterPosition 相对它),scale 为 TimecodeScale。失败返回 nil。
+func mkvBuildSeekPoints(cuesBody []byte, segDataOff int64, scale float64) []seekPoint {
+	var pts []seekPoint
+	off := 0
+	for off+2 <= len(cuesBody) {
+		id, n, ok := mkvElementID(cuesBody[off:])
+		if !ok {
+			break
+		}
+		so := off + n
+		if so >= len(cuesBody) {
+			break
+		}
+		sz, sn, unk, ok := mkvVint(cuesBody[so:])
+		if !ok || unk {
+			break
+		}
+		body, bend := so+sn, so+sn+int(sz)
+		if bend > len(cuesBody) {
+			break
+		}
+		if id == 0xBB { // CuePoint
+			var t uint64
+			var pos int64 = -1
+			co := body
+			for co+2 <= bend {
+				cid, cn, ok2 := mkvElementID(cuesBody[co:])
+				if !ok2 {
+					break
+				}
+				cso := co + cn
+				if cso >= bend {
+					break
+				}
+				csz, csn, cunk, ok3 := mkvVint(cuesBody[cso:])
+				if !ok3 || cunk {
+					break
+				}
+				cbody, cbend := cso+csn, cso+csn+int(csz)
+				if cbend > bend {
+					break
+				}
+				switch cid {
+				case 0xB3: // CueTime
+					var v uint64
+					for _, c := range cuesBody[cbody:cbend] {
+						v = v<<8 | uint64(c)
+					}
+					t = v
+				case 0xE7: // CueTrackPositions
+					po := cbody
+					for po+2 <= cbend {
+						pid, pn, ok4 := mkvElementID(cuesBody[po:])
+						if !ok4 {
+							break
+						}
+						pso := po + pn
+						if pso >= cbend {
+							break
+						}
+						psz, psn, punk, ok5 := mkvVint(cuesBody[pso:])
+						if !ok5 || punk {
+							break
+						}
+						pbody, pbend := pso+psn, pso+psn+int(psz)
+						if pbend > cbend {
+							break
+						}
+						if pid == 0xF1 { // CueClusterPosition
+							var v uint64
+							for _, c := range cuesBody[pbody:pbend] {
+								v = v<<8 | uint64(c)
+							}
+							pos = segDataOff + int64(v)
+						}
+						po = pbend
+					}
+				}
+				co = cbend
+			}
+			if pos >= 0 && scale > 0 {
+				pts = append(pts, seekPoint{float64(t) * scale / 1e9, pos})
+			}
+		}
+		off = bend
+	}
+	if len(pts) == 0 {
+		return nil
+	}
+	return downsampleSeekPoints(pts, 400)
 }
 
 // mkvCuesOffset 在尾部缓冲(覆盖文件内 [tailStart, fileSize))反向扫描 Cues
@@ -352,7 +450,226 @@ func mkvCuesOffset(tail []byte, tailStart, fileSize int64) int64 {
 	return -1
 }
 
-// ---------- 引擎编排 ----------
+// ---------- 播放头精确定位:容器索引时间→字节表 ----------
+// 播放器 seek/播放位置换算用的就是容器自带索引(MP4:stts/stsc/stco,
+// MKV:Cues)。探测已定位并 pin 了这份索引,顺势解析成 (秒,字节) 采样表
+// 下发前端,红线按 currentTime 二分查找——与播放器同源的精确换算,
+// 取代一切估算(均摊/内插在 VBR 与"推送-解析速率解耦"下原理性失准)。
+
+// seekPoint 播放头定位采样点(秒 → 文件内字节偏移)。
+type seekPoint struct {
+	t   float64
+	off int64
+}
+
+// mp4Child 在 atom 容器(body 字节)中找指定类型的子 atom,返回其 body
+// 区间 [off, off+size)。ok=false:未找到/越界。
+func mp4Child(body []byte, typ string) ([]byte, bool) {
+	var off int64
+	for off+8 <= int64(len(body)) {
+		asize := int64(binary.BigEndian.Uint32(body[off : off+4]))
+		t := string(body[off+4 : off+8])
+		hdr := int64(8)
+		if asize == 1 {
+			if off+16 > int64(len(body)) {
+				return nil, false
+			}
+			asize = int64(binary.BigEndian.Uint64(body[off+8 : off+16]))
+			hdr = 16
+		}
+		if asize < hdr || off+asize > int64(len(body)) {
+			return nil, false
+		}
+		if t == typ {
+			return body[off+hdr : off+asize], true
+		}
+		off += asize
+	}
+	return nil, false
+}
+
+func mp4U32(b []byte, off int) uint32 { return binary.BigEndian.Uint32(b[off : off+4]) }
+
+// mp4BuildSeekPoints 解析完整 moov 字节,构建视频轨(无则首轨)的
+// 时间→字节表,精确到 chunk 粒度;按字节步长降采样(进度条只需 piece 级
+// 精度)。失败返回 nil(调用方回退估算)。
+func mp4BuildSeekPoints(moov []byte) []seekPoint {
+	// 收集全部 trak(游标逐个取,≤16 防畸形)
+	var traks [][]byte
+	for cur := moov; len(traks) <= 16; {
+		body, ok := mp4Child(cur, "trak")
+		if !ok {
+			break
+		}
+		traks = append(traks, body)
+		cur = cur[afterChild(cur, "trak"):]
+	}
+	var stblBody []byte
+	var timescale uint32
+	for _, tk := range traks {
+		mdia, ok := mp4Child(tk, "mdia")
+		if !ok {
+			continue
+		}
+		mdhd, ok2 := mp4Child(mdia, "mdhd")
+		if !ok2 || len(mdhd) < 20 {
+			continue
+		}
+		ts := mp4U32(mdhd, 12) // v0:ctime mtime timescale(12) duration(16)
+		if mdhd[0] == 1 {
+			if len(mdhd) < 32 {
+				continue
+			}
+			ts = mp4U32(mdhd, 20)
+		}
+		if ts == 0 {
+			continue
+		}
+		hdlr, okH := mp4Child(mdia, "hdlr")
+		isVideo := okH && len(hdlr) >= 12 && string(hdlr[8:12]) == "vide"
+		minf, okM := mp4Child(mdia, "minf")
+		if !okM {
+			continue
+		}
+		stbl, okS := mp4Child(minf, "stbl")
+		if !okS {
+			continue
+		}
+		if stblBody == nil { // 暂存首轨作候选(可能无视频轨)
+			stblBody, timescale = stbl, ts
+		}
+		if isVideo { // 视频轨优先,命中即定
+			stblBody, timescale = stbl, ts
+			break
+		}
+	}
+	if stblBody == nil || timescale == 0 {
+		return nil
+	}
+	stts, ok := mp4Child(stblBody, "stts")
+	stsc, ok2 := mp4Child(stblBody, "stsc")
+	stco, ok3 := mp4Child(stblBody, "stco")
+	co64 := false
+	if !ok3 {
+		stco, ok3 = mp4Child(stblBody, "co64")
+		co64 = true
+	}
+	if !ok || !ok2 || !ok3 || len(stts) < 8 || len(stsc) < 8 || len(stco) < 4 {
+		return nil
+	}
+	// stts:(count, delta) 序列
+	nT := int(mp4U32(stts, 4))
+	type td struct{ n, d uint32 }
+	tts := make([]td, 0, nT)
+	p := 8
+	for i := 0; i < nT && p+8 <= len(stts); i++ {
+		tts = append(tts, td{mp4U32(stts, p), mp4U32(stts, p+4)})
+		p += 8
+	}
+	// stsc:(firstChunk, samplesPerChunk, sdi) 序列(1 基)
+	nC := int(mp4U32(stsc, 4))
+	type sc struct{ first, n uint32 }
+	scs := make([]sc, 0, nC)
+	p = 8
+	for i := 0; i < nC && p+12 <= len(stsc); i++ {
+		scs = append(scs, sc{mp4U32(stsc, p), mp4U32(stsc, p+4)})
+		p += 12
+	}
+	// stco:chunk 文件偏移
+	nO := int(mp4U32(stco, 4))
+	offs := make([]int64, 0, nO)
+	if co64 {
+		p = 8
+		for i := 0; i < nO && p+8 <= len(stco); i++ {
+			offs = append(offs, int64(binary.BigEndian.Uint64(stco[p:p+8])))
+			p += 8
+		}
+	} else {
+		p = 8
+		for i := 0; i < nO && p+4 <= len(stco); i++ {
+			offs = append(offs, int64(mp4U32(stco, p)))
+			p += 4
+		}
+	}
+	if len(tts) == 0 || len(scs) == 0 || len(offs) == 0 {
+		return nil
+	}
+	// 逐 chunk 发点:chunk 首样本时间 = 已累计时间;随后跳过本 chunk 样本
+	var pts []seekPoint
+	var timeU int64
+	ti, left := 0, tts[0].n
+	si := 0 // stsc 游标
+	for ci := 0; ci < len(offs); ci++ {
+		for si+1 < len(scs) && uint32(ci+1) >= scs[si+1].first {
+			si++
+		}
+		n := scs[si].n
+		pts = append(pts, seekPoint{float64(timeU) / float64(timescale), offs[ci]})
+		for k := uint32(0); k < n; k++ {
+			if left == 0 {
+				ti++
+				if ti >= len(tts) {
+					break
+				}
+				left = tts[ti].n
+			}
+			timeU += int64(tts[ti].d)
+			left--
+		}
+		if ti >= len(tts) && left == 0 && ci+1 < len(offs) {
+			// stts 提前耗尽(畸形):后续 chunk 时间不再可信,截断
+			break
+		}
+	}
+	return downsampleSeekPoints(pts, 400)
+}
+
+// mp4ChildExcept/afterChild 辅助(收集多 trak 用):afterChild 返回容器中
+// 指定类型首个子 atom 结束位置的字节游标。
+func afterChild(body []byte, typ string) int {
+	var off int64
+	for off+8 <= int64(len(body)) {
+		asize := int64(binary.BigEndian.Uint32(body[off : off+4]))
+		t := string(body[off+4 : off+8])
+		hdr := int64(8)
+		if asize == 1 {
+			if off+16 > int64(len(body)) {
+				return len(body)
+			}
+			asize = int64(binary.BigEndian.Uint64(body[off+8 : off+16]))
+			hdr = 16
+		}
+		if asize < hdr || off+asize > int64(len(body)) {
+			return len(body)
+		}
+		if t == typ {
+			return int(off + asize)
+		}
+		off += asize
+	}
+	return len(body)
+}
+
+// downsampleSeekPoints 按字节步长降采样并强制时间/偏移单调递增。
+func downsampleSeekPoints(pts []seekPoint, maxN int) []seekPoint {
+	if len(pts) <= maxN || len(pts) == 0 {
+		return pts
+	}
+	step := float64(pts[len(pts)-1].off-pts[0].off) / float64(maxN)
+	out := []seekPoint{pts[0]}
+	var nextOff = float64(pts[0].off) + step
+	for _, p := range pts[1:] {
+		if float64(p.off) >= nextOff {
+			out = append(out, p)
+			nextOff = float64(p.off) + step
+		}
+	}
+	// 末点兜底(步长取整可能漏掉)
+	if out[len(out)-1].off != pts[len(pts)-1].off {
+		out = append(out, pts[len(pts)-1])
+	}
+	return out
+}
 
 // btStreamProbe 开流时启动的一次性后台探测(每会话一次)。按扩展名分派;
 // 任何失败(等待超时/解析不出)都只是维持默认 pin,静默退出。
@@ -461,7 +778,8 @@ func streamAheadFor(bitrate float64, pieceLen int64) int {
 
 // btStreamProbeMP4:头 64KB 走查 atom 序列 → faststart(精化头 pin、解除尾
 // pin)或 moov 在尾(mdat 尺寸定位 moov 起点,尾部 pin 精化到 moov 起点到
-// 文件尾,头部缩到 mdat 起点);再读 moov 前缀解 mvhd 时长 → 码率自适应。
+// 文件尾,头部缩到 mdat 起点);读 moov 前缀解 mvhd 时长 → 码率自适应;
+// 最后整读 moov 解 stts/stsc/stco 构建"时间→字节"精确播放头定位表。
 func (m *Manager) btStreamProbeMP4(t *Task, st *taskStream, cl *bt.Client) {
 	deadline := time.Now().Add(streamProbeTimeout)
 	n := int64(streamProbeHeadMP4)
@@ -479,6 +797,14 @@ func (m *Manager) btStreamProbeMP4(t *Task, st *taskStream, cl *bt.Client) {
 	if !ok {
 		return
 	}
+	// 内容起点(播放头内插锚点):faststart=moov 结束、moov 在尾=mdat 起点
+	if r.headEnd > 0 {
+		t.mu.Lock()
+		if t.stream == st {
+			st.metaEnd = r.headEnd
+		}
+		t.mu.Unlock()
+	}
 	apply := func(head, tail []int, tailOn *bool, dur float64) {
 		t.mu.Lock()
 		streamApplyLocked(t, st, cl, head, tail, tailOn, dur)
@@ -492,6 +818,7 @@ func (m *Manager) btStreamProbeMP4(t *Task, st *taskStream, cl *bt.Client) {
 		}
 		noTail := false
 		apply(st.piecesOf(0, r.moovEnd), nil, &noTail, dur)
+		m.probeMP4SeekTable(t, st, cl, r.moovOff, r.moovEnd-r.moovOff, deadline)
 		return
 	}
 	if r.mdatEnd <= 0 || r.mdatEnd >= st.size {
@@ -510,9 +837,76 @@ func (m *Manager) btStreamProbeMP4(t *Task, st *taskStream, cl *bt.Client) {
 	if streamReadAt(st, cl, r.mdatEnd, buf) != nil {
 		return
 	}
+	// 时长 + 定位表:moov 起点处可能夹 free/skip 小 atom,逐个跳到 moov
+	moOff, moSize := m.probeMP4FindMoov(t, st, cl, r.mdatEnd, deadline)
 	if dur, ok := mp4MoovSeconds(buf); ok {
 		apply(nil, nil, nil, dur)
 	}
+	if moSize > 0 {
+		m.probeMP4SeekTable(t, st, cl, moOff, moSize, deadline)
+	}
+}
+
+// probeMP4FindMoov 在 moov 区域起点处跳过 free/skip/wide 小 atom 定位
+// moov(atom 起点与完整尺寸)。找不到返回 (0,-1)。
+func (m *Manager) probeMP4FindMoov(t *Task, st *taskStream, cl *bt.Client, at int64, deadline time.Time) (int64, int64) {
+	for i := 0; i < 8 && at+16 <= st.size; i++ {
+		hdr := make([]byte, 16)
+		if !m.streamWaitPieces(t, st, cl, at, 16, deadline) ||
+			streamReadAt(st, cl, at, hdr) != nil {
+			return 0, -1
+		}
+		asize := int64(binary.BigEndian.Uint32(hdr[0:4]))
+		typ := string(hdr[4:8])
+		hdrLen := int64(8)
+		if asize == 1 {
+			asize = int64(binary.BigEndian.Uint64(hdr[8:16]))
+			hdrLen = 16
+		}
+		if asize < hdrLen || at+asize > st.size {
+			return 0, -1
+		}
+		if typ == "moov" {
+			return at, asize
+		}
+		if typ != "free" && typ != "skip" && typ != "wide" {
+			return 0, -1
+		}
+		at += asize
+	}
+	return 0, -1
+}
+
+// probeMP4SeekTable 整读 moov(等待其 pin 的 piece 落定)并构建/落账
+// 时间→字节表。失败静默(红线回退锚点/均摊)。
+func (m *Manager) probeMP4SeekTable(t *Task, st *taskStream, cl *bt.Client, off, size int64, deadline time.Time) {
+	const maxMoov = 32 << 20
+	if off < 0 || size < 8 || size > maxMoov {
+		return
+	}
+	if !m.streamWaitPieces(t, st, cl, off, size, deadline) {
+		return
+	}
+	mo := make([]byte, size)
+	if streamReadAt(st, cl, off, mo) != nil {
+		return
+	}
+	body := 8
+	if mp4U32(mo, 0) == 1 { // 64 位长度头
+		body = 16
+	}
+	if int64(body) >= size {
+		return
+	}
+	pts := mp4BuildSeekPoints(mo[body:])
+	if len(pts) == 0 {
+		return
+	}
+	t.mu.Lock()
+	if t.stream == st {
+		st.seek = pts
+	}
+	t.mu.Unlock()
 }
 
 // btStreamProbeMKV:头 1MB 走查到首个 Cluster(精化头 pin)+ Info 时长;
@@ -525,16 +919,22 @@ func (m *Manager) btStreamProbeMKV(t *Task, st *taskStream, cl *bt.Client) {
 		n = st.size
 	}
 	var dur float64
+	var segDataOff int64
+	timeScale := 1e6
 	if n >= 16 && m.streamWaitPieces(t, st, cl, 0, n, deadline) {
 		head := make([]byte, n)
 		if streamReadAt(st, cl, 0, head) == nil {
 			r := mkvWalkHead(head, st.size)
 			dur = r.durSec
+			segDataOff, timeScale = r.segDataOff, r.timeScale
 			t.mu.Lock()
-			if r.headEnd > 0 && r.headEnd <= st.size {
-				streamApplyLocked(t, st, cl, st.piecesOf(0, r.headEnd), nil, nil, dur)
-			} else if dur > 0 {
-				streamApplyLocked(t, st, cl, nil, nil, nil, dur)
+			if t.stream == st {
+				if r.headEnd > 0 && r.headEnd <= st.size {
+					st.metaEnd = r.headEnd // 内容起点=首个 Cluster
+					streamApplyLocked(t, st, cl, st.piecesOf(0, r.headEnd), nil, nil, dur)
+				} else if dur > 0 {
+					streamApplyLocked(t, st, cl, nil, nil, nil, dur)
+				}
 			}
 			t.mu.Unlock()
 		}
@@ -555,6 +955,23 @@ func (m *Manager) btStreamProbeMKV(t *Task, st *taskStream, cl *bt.Client) {
 			t.mu.Lock()
 			streamApplyLocked(t, st, cl, nil, st.piecesOf(off, st.size-off), nil, 0)
 			t.mu.Unlock()
+			// Cues → 时间→字节表(播放头精确定位;与播放器同源)
+			if idx := off - tailStart; idx >= 0 && idx+4 < int64(len(tail)) {
+				if _, idn, ok1 := mkvElementID(tail[idx:]); ok1 {
+					if sz, sn, unk, ok2 := mkvVint(tail[idx+int64(idn):]); ok2 && !unk {
+						b := idx + int64(idn+sn)
+						if e := b + int64(sz); e >= b && e <= int64(len(tail)) {
+							if pts := mkvBuildSeekPoints(tail[b:e], segDataOff, timeScale); len(pts) > 0 {
+								t.mu.Lock()
+								if t.stream == st {
+									st.seek = pts
+								}
+								t.mu.Unlock()
+							}
+						}
+					}
+				}
+			}
 			return
 		}
 	}

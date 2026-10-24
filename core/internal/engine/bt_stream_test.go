@@ -400,3 +400,233 @@ func TestBTStreamCursorGating(t *testing.T) {
 		waitForStatus(t, m, id, StatusCompleted, 10*time.Second)
 	}
 }
+
+// TestBTStreamCompleted 完成态直读:任务完成(做种结束、会话已拆)后开流
+// 不再被拒——边看边下途中完成转做种、做种达标停止时,播放中的流重连走
+// done 模式直读最终文件无缝续播。位图全量、等待恒通、预热无操作、代次门
+// 照常生效。
+func TestBTStreamCompleted(t *testing.T) {
+	tracker := fakeTracker(t)
+	srcRoot, torrent, content := streamSeedSource(t)
+	meta, err := bt.ParseTorrent(torrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if torrent, err = bt.BuildTorrentBytes(meta, tracker.URL+"/announce", ""); err != nil {
+		t.Fatal(err)
+	}
+	if meta, err = bt.ParseTorrent(torrent); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := bt.NewSeedClient(meta, srcRoot, bt.ClientConfig{MaxPeers: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed.Start()
+	defer seed.Close()
+
+	dl := streamTempDir(t)
+	m := NewManager(testConf(dl), filepath.Join(t.TempDir(), "cfg.json"), filepath.Join(t.TempDir(), "tasks"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer stopManager(cancel, m)
+	go m.Run(ctx)
+	time.Sleep(300 * time.Millisecond)
+
+	views, errs := m.AddBT(CreateReq{TorrentB64: base64.StdEncoding.EncodeToString(torrent)})
+	if len(errs) > 0 {
+		t.Fatalf("创建失败: %v", errs)
+	}
+	id := views[0].ID
+
+	// 等下载走完;开自动做种时先停止做种落回完成态(会话随之拆除)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		v, ok := m.Get(id)
+		if !ok {
+			t.Fatal("任务消失")
+		}
+		if v.Status == StatusSeeding {
+			if err = m.StopSeeding(id); err != nil {
+				t.Fatal(err)
+			}
+			waitForStatus(t, m, id, StatusCompleted, 10*time.Second)
+			break
+		}
+		if v.Status == StatusCompleted {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if v, _ := m.Get(id); v.Status != StatusCompleted {
+		t.Fatalf("任务应已完成,状态 %s", v.Status)
+	}
+
+	// 完成态开流:不再拒绝(旧实现返回 ErrStreamCompleted)
+	info, err := m.BTStreamOpen(id, "video.mp4", 5)
+	if err != nil {
+		t.Fatalf("完成态开流应放行: %v", err)
+	}
+	if info.Size != int64(len(content)) {
+		t.Fatalf("文件大小不符: %d", info.Size)
+	}
+	// 等待恒通 + 直读字节级比对(头/中段/尾)
+	wctx, wcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer wcancel()
+	for _, off := range []int64{0, int64(len(content)) / 2, int64(len(content)) - 16<<10} {
+		if err = m.BTStreamWait(wctx, id, off, 16<<10); err != nil {
+			t.Fatalf("完成态等待应恒通(off=%d): %v", off, err)
+		}
+		buf := make([]byte, 16<<10)
+		if err = m.BTStreamRead(id, off, buf); err != nil {
+			t.Fatalf("完成态直读(off=%d): %v", off, err)
+		}
+		if !bytes.Equal(buf, content[off:off+16<<10]) {
+			t.Fatalf("完成态直读数据不符(off=%d)", off)
+		}
+	}
+	if !m.BTStreamPieceDone(id, 0) {
+		t.Fatal("完成态 PieceDone 应恒真")
+	}
+	// 状态:streaming + 全量位图 + 无窗口/pin
+	st, err := m.BTStreamStatus(id)
+	if err != nil || !st.Streaming || st.Pieces == "" {
+		t.Fatalf("完成态状态异常: %+v err=%v", st, err)
+	}
+	if st.CursorPiece != -1 || st.Ahead != 0 {
+		t.Fatalf("完成态不应有引擎窗口/游标: cursor=%d ahead=%d", st.CursorPiece, st.Ahead)
+	}
+	raw, err := base64.StdEncoding.DecodeString(st.Pieces)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := st.LastPiece - st.FirstPiece + 1
+	if len(raw) != (n+7)/8 {
+		t.Fatalf("位图长度不符: %d != %d", len(raw), (n+7)/8)
+	}
+	for i := 0; i < n; i++ {
+		if raw[i/8]&(1<<(7-uint(i%8))) == 0 {
+			t.Fatalf("完成态位图应全 1(piece %d)", i)
+		}
+	}
+	// 预热:完成态无优先级,无操作成功
+	if err = m.BTStreamWarm(id, "video.mp4"); err != nil {
+		t.Fatalf("完成态预热应为无操作: %v", err)
+	}
+	// 代次门照常:旧代次拒绝,会话不动
+	if _, err = m.BTStreamOpen(id, "video.mp4", 3); !errors.Is(err, ErrStreamStale) {
+		t.Fatalf("旧代次应拒绝,得到 %v", err)
+	}
+	m.BTStreamStop(id)
+	if st, _ = m.BTStreamStatus(id); st.Streaming {
+		t.Fatal("停止后不应仍处于流播状态")
+	}
+}
+
+// TestBTStreamReadaheadGuard 预读连接归属守卫:浏览器为向前预取会另开
+// 远处起点的开放式 Range 连接——属主活跃吐数期间到达的这类连接按预读
+// 处理(不抢游标/锚点);属主停滞后的远处开放式连接视为拖动后的新播放
+// 连接,正常接管。
+func TestBTStreamReadaheadGuard(t *testing.T) {
+	tracker := fakeTracker(t)
+	srcRoot, torrent, _ := streamSeedSource(t)
+	meta, err := bt.ParseTorrent(torrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if torrent, err = bt.BuildTorrentBytes(meta, tracker.URL+"/announce", ""); err != nil {
+		t.Fatal(err)
+	}
+	if meta, err = bt.ParseTorrent(torrent); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := bt.NewSeedClient(meta, srcRoot, bt.ClientConfig{MaxPeers: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed.SetLimits(0, 128*1024)
+	seed.Start()
+	defer seed.Close()
+
+	dl := streamTempDir(t)
+	m := NewManager(testConf(dl), filepath.Join(streamTempDir(t), "cfg.json"), filepath.Join(streamTempDir(t), "tasks"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer stopManager(cancel, m)
+	go m.Run(ctx)
+	time.Sleep(300 * time.Millisecond)
+
+	views, errs := m.AddBT(CreateReq{TorrentB64: base64.StdEncoding.EncodeToString(torrent)})
+	if len(errs) > 0 {
+		t.Fatalf("创建失败: %v", errs)
+	}
+	id := views[0].ID
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err = m.BTStreamOpen(id, "video.mp4", 0); err == nil {
+			break
+		}
+		if !errors.Is(err, ErrStreamNoSession) {
+			t.Fatalf("BTStreamOpen: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("BTStreamOpen 重试超时: %v", err)
+	}
+	pl := int64(16384)
+	cur := func() int {
+		st, err := m.BTStreamStatus(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.CursorPiece
+	}
+
+	// 主连接 A:Range 0,吐数活跃(游标推进到 2)
+	seqA, err := m.BTStreamConnOpen(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.BTStreamConnClose(id, seqA)
+	m.BTStreamPos(id, seqA, 0, true)
+	m.BTStreamServed(id, seqA, 2*pl)
+	if got := cur(); got != 2 {
+		t.Fatalf("主连接吐数应推进游标到 2,得到 %d", got)
+	}
+	// 预读连接 B:属主活跃(lastAt 刚更新)时,远处开放式 Range → 不抢游标
+	seqB, err := m.BTStreamConnOpen(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.BTStreamConnClose(id, seqB)
+	far := 100 * pl // 100 片之外
+	m.BTStreamPos(id, seqB, far, true)
+	if got := cur(); got != 2 {
+		t.Fatalf("活跃属主在场时预读连接不得抢游标,期望 2 得到 %d", got)
+	}
+	m.BTStreamServed(id, seqB, far+pl)
+	if got := cur(); got != 2 {
+		t.Fatalf("预读连接吐数不得推进游标,期望 2 得到 %d", got)
+	}
+	// 服务区间记账仍是属主 A 的(锚点不被预读带走)
+	if st, _ := m.BTStreamStatus(id); st.ServeStart != 0 || st.ServeEnd != 2*pl {
+		t.Fatalf("活动服务区间应保持属主 A 的 0..2 片,得到 %d..%d", st.ServeStart/pl, st.ServeEnd/pl)
+	}
+	// 属主停滞(>3s 无吐数)后,远处开放式连接 = 拖动后的新播放连接 → 接管
+	time.Sleep(3500 * time.Millisecond)
+	seqC, err := m.BTStreamConnOpen(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.BTStreamConnClose(id, seqC)
+	m.BTStreamPos(id, seqC, far, true)
+	if got := cur(); got != int(far/pl) {
+		t.Fatalf("属主停滞后远处开放式连接应接管游标,期望 %d 得到 %d", far/pl, got)
+	}
+	m.BTStreamStop(id)
+	if v, _ := m.Get(id); v.Status == StatusSeeding {
+		if err := m.StopSeeding(id); err != nil {
+			t.Fatal(err)
+		}
+		waitForStatus(t, m, id, StatusCompleted, 10*time.Second)
+	}
+}
