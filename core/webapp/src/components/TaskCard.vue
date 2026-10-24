@@ -12,10 +12,17 @@ const displayName = computed(() => props.t.filename || magnetFallbackName(props.
 const canOpen = computed(() => props.t.status === "completed" || props.t.status === "seeding");
 // 单文件视频种子(running/seeding):文件名点击直达边下边播,优先于打开文件
 const canStream = computed(() => props.t.streamable && ["running", "seeding"].includes(props.t.status));
+// 多文件 BT 种子:标题点击进详情文件页(文件树里可挑文件/播放)
+const canFiles = computed(() => props.t.kind === "bt" && (props.t.fileCount || 0) > 1);
 const nameClick = () => {
   if (canStream.value) {
     store.player = { taskId: props.t.id, file: "" }; // file 空 = 单文件种子由引擎解析
     openOverlay("playerOverlay");
+    return;
+  }
+  if (canFiles.value) {
+    store.pendingTab = "files";
+    store.actions.openDrawer && store.actions.openDrawer(props.t.id);
     return;
   }
   if (canOpen.value) openTaskFile(props.t.id);
@@ -23,9 +30,11 @@ const nameClick = () => {
 // 文件名 title:完成后提示完整落盘路径;分隔符沿用旧版 "\\"(Mac 批次再按平台取 sep)
 const nameTitle = computed(() => canStream.value
   ? "点击边下边播"
-  : canOpen.value
-    ? props.t.dir + "\\" + props.t.filename
-    : displayName.value);
+  : canFiles.value
+    ? "点击查看文件列表"
+    : canOpen.value
+      ? props.t.dir + "\\" + props.t.filename
+      : displayName.value);
 const iconText = computed(() => iconLabel(props.t));
 const iconCls = computed(() => iconClass(props.t));
 const statusText = computed(() => STATUS_TEXT[props.t.status] || props.t.status);
@@ -142,7 +151,7 @@ const segBars = computed(() => {
     <div class="task-head">
       <div class="file-icon" :class="iconCls">{{ iconText }}</div>
       <div class="task-title">
-        <div class="name" :class="{ clickable: canOpen || canStream, streamable: canStream }" :title="nameTitle" @click="nameClick">{{ displayName }}<span v-if="canStream" class="name-play" v-html="ms('play_circle')"></span></div>
+        <div class="name" :class="{ clickable: canOpen || canStream || canFiles, streamable: canStream }" :title="nameTitle" @click="nameClick">{{ displayName }}<span v-if="canStream" class="name-play" v-html="ms('play_circle')"></span></div>
         <div class="url" :title="t.url">{{ t.url }}</div>
       </div>
       <span class="status-chip" :class="t.status">{{ statusText }}</span>

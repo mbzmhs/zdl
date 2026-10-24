@@ -5,7 +5,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -78,7 +80,11 @@ func parseRangeHeader(hdr string, size int64) (start, end int64, hasRange, ok bo
 // piece 对齐逐块等待落定、读盘、flush——绝不把未落定区域用零填充发出。
 func (s *Server) handleBTStream(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	info, err := s.mgr.BTStreamOpen(id, r.URL.Query().Get("file"))
+	// v = 前端切集的单调代次(缺省 0 = 外部播放器):快速切集后被放弃的
+	// 播放器资源重试旧 URL 时携带旧代次,引擎据此拒绝,防止流会话被拽回
+	// 旧文件(位图/游标横跳)
+	epoch, _ := strconv.ParseInt(r.URL.Query().Get("v"), 10, 64)
+	info, err := s.mgr.BTStreamOpen(id, r.URL.Query().Get("file"), epoch)
 	if err != nil {
 		writeErr(w, statusFor(err), err.Error())
 		return
@@ -193,6 +199,23 @@ func (s *Server) handleBTStreamStatus(w http.ResponseWriter, r *http.Request) {
 // handleBTStreamStop 停止边下边播,还原纯下载优先级。
 func (s *Server) handleBTStreamStop(w http.ResponseWriter, r *http.Request) {
 	if err := s.mgr.BTStreamStop(r.PathValue("id")); err != nil {
+		writeErr(w, statusFor(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleBTStreamWarm 剧集预热:把下一集文件的头/尾元数据 piece 并入最高
+// 优先级 pin(不切换播放会话)。body: {"file":"种子内相对路径"}。
+func (s *Server) handleBTStreamWarm(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		File string `json:"file"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
+		return
+	}
+	if err := s.mgr.BTStreamWarm(r.PathValue("id"), req.File); err != nil {
 		writeErr(w, statusFor(err), err.Error())
 		return
 	}

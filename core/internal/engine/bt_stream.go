@@ -35,6 +35,10 @@ var (
 	ErrStreamNoSession = errors.New("会话未运行,无法边下边播")
 	// ErrStreamCompleted 任务已完成:数据全在盘上,直接打开文件即可。
 	ErrStreamCompleted = errors.New("任务已完成,请直接打开文件")
+	// ErrStreamStale 迟到的旧代次开流请求(快速切集后被放弃的播放器资源
+	// 重试/迟达):接受它会把整个流会话切回旧文件——位图/游标/pin 全部
+	// 跟着横跳。带旧代次的请求直接拒绝;不带代次(外部播放器)不受限。
+	ErrStreamStale = errors.New("旧播放会话的请求")
 )
 
 // btMediaExts 可边下边播的媒体扩展名(默认文件挑选与前端播放入口共用口径)。
@@ -61,6 +65,14 @@ type taskStream struct {
 	lastSeq  int64      // 游标权属主连接(0 = 无属主;仅 Pos(streaming) 或
 	                   // 吐数接管可赋值——探测连接、幽灵连接均不可)
 	conns    map[int64]*streamConn // 打开中的流连接(含各自服务区间)
+	// pin 事实源(开流默认 1MB 头/尾;容器探测精化、预热合并后经
+	// streamApplyLocked 下发 picker;切文件即随会话整体作废)
+	pinHead []int
+	pinTail []int
+	tailOn  bool
+	warm    map[string][]int // 预热文件 → 并入 pin 的 piece 集(剧集下一集)
+	bitrate float64          // 容器探测出的平均码率 B/s(0 = 未知;窗口自适应与前端提示)
+	metaOn  bool             // 容器探测已启动(同文件重开不重复探测)
 }
 
 // streamConn 单条流连接的服务区间记账(文件内字节,供播放头时间→字节内插
@@ -128,10 +140,30 @@ type BTStreamStatus struct {
 	//(从头播)同样有效。
 	ServeStart int64 `json:"serveStart"`
 	ServeEnd   int64 `json:"serveEnd"`
+	// Bitrate 容器探测的平均码率 B/s(0 = 未知);Speed 任务当前下载速度 B/s。
+	// 前端据 Speed < Bitrate 提示"速度低于码率,可能反复缓冲"。
+	Bitrate float64 `json:"bitrate,omitempty"`
+	Speed   float64 `json:"speed,omitempty"`
+	// Warming 剧集预热已触发(下一集头/尾 piece 已并入最高优先级);
+	// WarmReady 预热的 piece 已全部落定(元数据在盘,切集秒开)。
+	Warming   bool `json:"warming,omitempty"`
+	WarmReady bool `json:"warmReady,omitempty"`
 }
 
 // btNormPath 归一路径分隔符(\ → /,与 WantedPiecesFor 的口径一致)。
 func btNormPath(p string) string { return strings.Join(strings.Split(p, "\\"), "/") }
+
+// piecesWithin 过滤出 [lo,hi] 区间内的 piece 下标(不修改入参切片——
+// StreamState 返回的是 picker 内部切片的引用)。
+func piecesWithin(ps []int, lo, hi int) []int {
+	var out []int
+	for _, p := range ps {
+		if p >= lo && p <= hi {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // streamContentType 按扩展名给 Content-Type(未知给 octet-stream,本地
 // 播放器按内容探测照样能播)。
@@ -191,8 +223,10 @@ func btStreamMeta(t *Task) (*bt.MetaInfo, error) {
 // BTStreamOpen 开启(或切换)任务的边下边播。file 为种子内相对路径;
 // 空 = 单文件种子取唯一文件,多文件优先取最大的媒体文件(无媒体扩展名
 // 则取最大文件)。幂等:重复打开同一文件只刷新活跃时间,换文件则整体
-// 重算 pin/窗口。
-func (m *Manager) BTStreamOpen(id, file string) (*BTStreamInfo, error) {
+// 重算 pin/窗口。epoch 为调用方(前端)的单调代次:0 = 不参与代次判定
+// (外部播放器);携带且小于任务当前代次的请求视为迟到旧请求,拒绝
+// (ErrStreamStale)——防快速切集后被放弃的播放器资源把会话拽回旧文件。
+func (m *Manager) BTStreamOpen(id, file string, epoch int64) (*BTStreamInfo, error) {
 	t := m.get(id)
 	if t == nil {
 		return nil, ErrNotFound
@@ -201,6 +235,16 @@ func (m *Manager) BTStreamOpen(id, file string) (*BTStreamInfo, error) {
 	kind, status := t.Kind, t.Status
 	wantedFiles := t.WantedFiles
 	prev := t.stream
+	// 代次门:快速切集后被放弃的播放器资源(重试/迟到的旧连接)携带旧
+	// 代次,放行会把会话切回旧文件——位图/游标/pin 随之横跳。旧代次一律
+	// 拒绝;0(外部播放器/测试)不参与判定,保持自由切换语义
+	if epoch > 0 && epoch < t.streamEpoch {
+		t.mu.Unlock()
+		return nil, ErrStreamStale
+	}
+	if epoch > t.streamEpoch {
+		t.streamEpoch = epoch
+	}
 	t.mu.Unlock()
 	if kind != KindBT {
 		return nil, errors.New("仅 BT 任务支持边下边播")
@@ -305,10 +349,20 @@ func (m *Manager) BTStreamOpen(id, file string) (*BTStreamInfo, error) {
 			file: fp, fi: fi, size: size, off: meta.Files[fi].Offset,
 			pieceLen: meta.PieceLength, first: first, last: last,
 			opened: now, lastAt: now, conns: map[int64]*streamConn{},
+			pinHead: pinHead, pinTail: pinTail, tailOn: true,
 		}
 	}
 	st := t.stream
+	probe := st != nil && !st.metaOn && !cl.Completed()
+	if probe {
+		st.metaOn = true
+	}
 	t.mu.Unlock()
+	if probe {
+		// 容器元数据探测(一次性后台):精化头/尾 pin、faststart 解除尾部、
+		// 时长→码率→窗口自适应。会话失配(换文件/停止/结束)自行退出。
+		go m.btStreamProbe(t, st, cl)
+	}
 	return &BTStreamInfo{
 		File:        st.file,
 		Size:        st.size,
@@ -553,9 +607,13 @@ func (m *Manager) BTStreamStatus(id string) (*BTStreamStatus, error) {
 	t.mu.Lock()
 	st, cl := t.stream, t.btcl
 	kind := t.Kind
+	speed, bitrate := float64(t.speed), 0.0
 	var serve *streamConn
+	var warmSets map[string][]int
 	if st != nil {
 		serve = st.activeConnLocked() // conns/lastSeq 受 t.mu 保护,锁内取
+		bitrate = st.bitrate
+		warmSets = st.warm
 	}
 	t.mu.Unlock()
 	if kind != KindBT {
@@ -576,6 +634,8 @@ func (m *Manager) BTStreamStatus(id string) (*BTStreamStatus, error) {
 	if st.off > 0 {
 		out.FileOffset = st.off
 	}
+	out.Bitrate = bitrate
+	out.Speed = speed
 	if cl != nil {
 		bits := cl.HaveBits()
 		n := st.last - st.first + 1
@@ -586,11 +646,16 @@ func (m *Manager) BTStreamStatus(id string) (*BTStreamStatus, error) {
 			}
 		}
 		out.Pieces = base64.StdEncoding.EncodeToString(packed)
-		// 引擎优先级位置(分块图:窗口带/前沿深度/pin 区间/下载游标)
+		// 引擎优先级位置(分块图:窗口带/前沿深度/pin 区间/下载游标)。
+		// pin 展示口径:只报当前文件区间内的 piece——预热下一集的 pin 在本
+		// 文件区间外,按"首~尾"夹逼画带会把整条进度条涂黄;跨文件的共享
+		// 边界 piece 仍在区间内,如实显示
 		if cur, ahead, depth, ph, pt, tailOn, ok := cl.StreamState(); ok {
 			out.CursorPiece = cur
 			out.Ahead = ahead
 			out.Depth = depth
+			ph = piecesWithin(ph, st.first, st.last)
+			pt = piecesWithin(pt, st.first, st.last)
 			if len(ph) > 0 {
 				out.PinHeadFirst, out.PinHeadLast = ph[0], ph[len(ph)-1]
 			}
@@ -602,6 +667,24 @@ func (m *Manager) BTStreamStatus(id string) (*BTStreamStatus, error) {
 		// 的零长度区间也下发:前端 span=0 时红线直接贴 seek 点,优于均摊回退
 		if serve != nil && serve.end >= serve.start && (serve.start != 0 || serve.end != 0) {
 			out.ServeStart, out.ServeEnd = serve.start, serve.end
+		}
+	}
+	// 剧集预热状态:已触发 + 预热的 piece 是否全部落定(黄点=下载中,
+	// 绿点=元数据已在盘,切集秒开)
+	if len(warmSets) > 0 {
+		out.Warming = true
+		if cl != nil {
+			ready := true
+		warm:
+			for _, ps := range warmSets {
+				for _, p := range ps {
+					if !cl.StreamPieceDone(int64(p)*st.pieceLen, 1) {
+						ready = false
+						break warm
+					}
+				}
+			}
+			out.WarmReady = ready
 		}
 	}
 	return out, nil
@@ -620,6 +703,87 @@ func (m *Manager) BTStreamStop(id string) error {
 	if cl != nil {
 		cl.ClearStreaming()
 	}
+	return nil
+}
+
+// BTStreamWarm 剧集预热:把另一文件(通常下一集)的头/尾元数据 piece 并入
+// pin 常驻最高优先级,切集时索引已在盘、秒开。不切换播放会话、不移动游标。
+// 幂等:同一文件重复预热只记账一次。
+func (m *Manager) BTStreamWarm(id, file string) error {
+	t := m.get(id)
+	if t == nil {
+		return ErrNotFound
+	}
+	if file == "" {
+		return errors.New("缺少文件参数")
+	}
+	t.mu.Lock()
+	st := t.stream
+	cl := t.btcl
+	wantedFiles := t.WantedFiles
+	t.mu.Unlock()
+	if st == nil || cl == nil {
+		return ErrStreamNoSession
+	}
+	meta, err := btStreamMeta(t)
+	if err != nil {
+		return err
+	}
+	want := btNormPath(file)
+	fi := -1
+	for i := range meta.Files {
+		if strings.Join(meta.Files[i].Path, "/") == want {
+			fi = i
+			break
+		}
+	}
+	if fi < 0 {
+		return fmt.Errorf("种子中不存在文件: %s", file)
+	}
+	if len(wantedFiles) > 0 {
+		ok := false
+		for _, w := range wantedFiles {
+			if btNormPath(w) == want {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return ErrStreamNotWanted
+		}
+	}
+	if !meta.LayerKnown(fi) {
+		return ErrStreamV2Deferred
+	}
+	first, last := meta.FilePieceRange(fi)
+	pinN := int(streamPinBytes / meta.PieceLength)
+	if pinN < 1 {
+		pinN = 1
+	}
+	pieces := make([]int, 0, pinN*2)
+	for p := first; p <= last && p < first+pinN; p++ {
+		pieces = append(pieces, p)
+	}
+	for p := last; p >= first && p > last-pinN; p-- {
+		pieces = append(pieces, p)
+	}
+	t.mu.Lock()
+	st = t.stream // 期间可能被换会话:重取复核
+	cl = t.btcl
+	if st == nil || cl == nil {
+		t.mu.Unlock()
+		return ErrStreamNoSession
+	}
+	if st.warm == nil {
+		st.warm = map[string][]int{}
+	}
+	if _, done := st.warm[want]; done {
+		t.mu.Unlock()
+		return nil
+	}
+	st.warm[want] = pieces
+	streamApplyLocked(t, st, cl, nil, nil, nil, 0)
+	t.mu.Unlock()
 	return nil
 }
 

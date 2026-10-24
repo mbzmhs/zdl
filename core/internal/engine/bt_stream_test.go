@@ -126,7 +126,7 @@ func TestBTStreamWhileDownloading(t *testing.T) {
 	// 开流:多文件种子按文件相对路径(会话挂载与状态置位有几毫秒差,重试)
 	var info *BTStreamInfo
 	for time.Now().Before(deadline) {
-		info, err = m.BTStreamOpen(id, "video.mp4")
+		info, err = m.BTStreamOpen(id, "video.mp4", 0)
 		if err == nil {
 			break
 		}
@@ -249,12 +249,12 @@ func TestBTStreamOpenGuards(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	if _, err := m.BTStreamOpen(id, "不存在.bin"); err == nil {
+	if _, err := m.BTStreamOpen(id, "不存在.bin", 0); err == nil {
 		t.Fatal("不存在的文件应报错")
 	}
 	var serr error
 	for time.Now().Before(deadline) {
-		if _, serr = m.BTStreamOpen(id, "video.mp4"); serr == nil {
+		if _, serr = m.BTStreamOpen(id, "video.mp4", 0); serr == nil {
 			break
 		}
 		if !errors.Is(serr, ErrStreamNoSession) {
@@ -306,7 +306,7 @@ func TestBTStreamCursorGating(t *testing.T) {
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err = m.BTStreamOpen(id, "video.mp4"); err == nil {
+		if _, err = m.BTStreamOpen(id, "video.mp4", 0); err == nil {
 			break
 		}
 		if !errors.Is(err, ErrStreamNoSession) {

@@ -252,3 +252,53 @@ func TestPickerStreamDepth(t *testing.T) {
 		t.Fatalf("窗口耗尽应 mini-endgame 补前沿 17,得到 %d ok=%v", pc, ok)
 	}
 }
+
+// TestPickerStreamRefinePins 元数据探测精化:UpdateStreamPins 整体替换头/尾
+// pin 并可同时解除尾部;替换后认领顺序立即按新 pin 走。
+func TestPickerStreamRefinePins(t *testing.T) {
+	p := newStreamPicker(20)
+	p.EnableStreaming([]int{0}, []int{19}, 4)
+	p.SetStreamCursor(5)
+	if got := claimDone(t, p, allHave); got != 0 {
+		t.Fatalf("默认头 pin 应为 0,得到 %d", got)
+	}
+	// 探测结论:moov 在 piece 9(faststart):头 pin 精化到 [0,9],尾部解除
+	p.UpdateStreamPins([]int{1, 9}, nil, false)
+	if got := claimDone(t, p, allHave); got != 1 {
+		t.Fatalf("精化后头 pin 首片应为 1,得到 %d", got)
+	}
+	if got := claimDone(t, p, allHave); got != 9 {
+		t.Fatalf("精化头 pin 第二片应为 9,得到 %d", got)
+	}
+	// 尾部已解除:直接进窗口(旧尾 pin 19 不再优先)
+	if got := claimDone(t, p, allHave); got != 5 {
+		t.Fatalf("尾部解除后应进窗口 5,得到 %d", got)
+	}
+	_, _, _, ph, pt, tailOn, _ := p.StreamState()
+	if len(ph) != 2 || ph[0] != 1 || ph[1] != 9 || len(pt) != 1 || tailOn {
+		t.Fatalf("StreamState 应反映精化结果,ph=%v pt=%v tailOn=%v", ph, pt, tailOn)
+	}
+}
+
+// TestPickerStreamSetAhead 码率自适应窗口:SetStreamAhead 重设宽度,深度
+// 随之重钳;游标不动。
+func TestPickerStreamSetAhead(t *testing.T) {
+	p := newStreamPicker(24)
+	p.EnableStreaming(nil, nil, 20) // depth 钳 16
+	p.SetStreamCursor(0)
+	p.SetStreamAhead(4)
+	_, ahead, depth, _, _, _, on := p.StreamState()
+	if !on || ahead != 4 || depth != 4 {
+		t.Fatalf("自适应后窗口/深度应为 4/4,得到 %d/%d on=%v", ahead, depth, on)
+	}
+	// 窗口 [0,4):严格顺序只到 3;第 5 片(4)在窗口外,深度耗尽走 mini-endgame
+	for want := 0; want < 4; want++ {
+		if pc, _, _, ok := p.Claim(allHave); !ok || pc != want {
+			t.Fatalf("窄窗口内应顺序 %d,得到 %d ok=%v", want, pc, ok)
+		}
+	}
+	if pc, _, _, ok := p.Claim(allHave); !ok || pc != 0 {
+		t.Fatalf("窄窗口耗尽应 mini-endgame 补前沿 0,得到 %d ok=%v", pc, ok)
+	}
+}
+

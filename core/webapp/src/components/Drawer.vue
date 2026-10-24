@@ -69,7 +69,9 @@ function openDrawer(id) {
   store.detailId = id;
   dwLimitDirty.value = false; // 新任务打开:输入框按服务端值重建
   dwSelDirty.value = false;
-  switchTab("overview");
+  // 指定落地页签(任务卡多文件 BT 标题 → 文件页),一次性消费后回到默认
+  switchTab(store.pendingTab || "overview");
+  store.pendingTab = "";
   // 速度历史按任务保留;任务删除后残留条目超限时清理
   if (speedHistMap.size > 60) {
     const alive = new Set(store.tasks.map(x => x.id));

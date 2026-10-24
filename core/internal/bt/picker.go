@@ -740,6 +740,41 @@ func (p *PiecePicker) EnableStreaming(pinHead, pinTail []int, ahead int) {
 	p.mu.Unlock()
 }
 
+// UpdateStreamPins 元数据探测完成后精化 pin 区间:整体替换头/尾 pin(nil =
+// 该项不变)并可同时解除尾部(faststart:moov 在头,尾部无索引可省)。
+// pin 下标为全局口径,可超出发开流时的默认 1MB 范围(moov 大于 1MB 时必须
+// 扩,否则索引残缺);也用于剧集预热把下一集头尾 piece 并入 pin(引擎侧
+// 自行合并后传入)。
+func (p *PiecePicker) UpdateStreamPins(pinHead, pinTail []int, tailOn bool) {
+	p.mu.Lock()
+	if p.stream != nil {
+		if pinHead != nil {
+			p.stream.pinHead = append([]int(nil), pinHead...)
+		}
+		if pinTail != nil {
+			p.stream.pinTail = append([]int(nil), pinTail...)
+		}
+		p.stream.tailOn = tailOn
+	}
+	p.mu.Unlock()
+}
+
+// SetStreamAhead 重设播放窗口宽度(piece 数,引擎按探测出的码率 × 目标缓冲
+// 秒数折算)。深度随之重钳;游标不动。
+func (p *PiecePicker) SetStreamAhead(ahead int) {
+	if ahead < 1 {
+		ahead = 1
+	}
+	p.mu.Lock()
+	if p.stream != nil {
+		p.stream.ahead = ahead
+		if p.stream.depth > ahead {
+			p.stream.depth = ahead
+		}
+	}
+	p.mu.Unlock()
+}
+
 // DisableStreaming 关闭流模式,完全回到稀有优先。幂等。
 func (p *PiecePicker) DisableStreaming() {
 	p.mu.Lock()

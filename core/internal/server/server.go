@@ -153,6 +153,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/stream", s.handleBTStream)
 	mux.HandleFunc("GET /api/tasks/{id}/stream/status", s.handleBTStreamStatus)
 	mux.HandleFunc("POST /api/tasks/{id}/stream/stop", s.handleBTStreamStop)
+	mux.HandleFunc("POST /api/tasks/{id}/stream/warm", s.handleBTStreamWarm)
 	mux.HandleFunc("POST /api/tasks/{id}/files", s.handleTaskFiles)
 	mux.HandleFunc("GET /api/tasks/{id}/detail", s.handleTaskDetail)
 	mux.HandleFunc("POST /api/tasks/{id}/trackers", s.handleTaskTrackers)
@@ -1260,8 +1261,9 @@ func statusFor(err error) int {
 		return http.StatusNotFound
 	}
 	if errors.Is(err, engine.ErrStreamNotWanted) || errors.Is(err, engine.ErrStreamNoSession) ||
-		errors.Is(err, engine.ErrStreamV2Deferred) || errors.Is(err, engine.ErrStreamCompleted) {
-		return http.StatusConflict // 前置条件不满足:需扩选/会话未运行/文件不支持/已完成
+		errors.Is(err, engine.ErrStreamV2Deferred) || errors.Is(err, engine.ErrStreamCompleted) ||
+		errors.Is(err, engine.ErrStreamStale) {
+		return http.StatusConflict // 前置条件不满足:需扩选/会话未运行/文件不支持/已完成/旧代次
 	}
 	return http.StatusBadRequest
 }

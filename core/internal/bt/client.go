@@ -3162,6 +3162,17 @@ func (c *Client) ClearStreaming() {
 	c.streamOn.Store(false)
 }
 
+// RefineStreamPins 元数据探测后精化 pin 区间(整体替换;tailOn=false 同时
+// 解除尾部 pin,faststart 场景)。含剧集预热并入的下一集头尾 piece。
+func (c *Client) RefineStreamPins(pinHead, pinTail []int, tailOn bool) {
+	c.picker.UpdateStreamPins(pinHead, pinTail, tailOn)
+}
+
+// SetStreamAhead 按探测码率重设播放窗口宽度(piece 数)。
+func (c *Client) SetStreamAhead(pieces int) {
+	c.picker.SetStreamAhead(pieces)
+}
+
 // Streaming 报告边下边播优先级是否生效。
 func (c *Client) Streaming() bool { return c.streamOn.Load() }
 
