@@ -22,14 +22,17 @@ cd "$core"
 echo "== go version =="
 go version
 
-echo "== go vet =="
-go vet -tags "desktop,production" ./...
+# Web 构建必须在 go vet/test 之前:core/web/(go:embed 嵌入根)已改为不入库、
+# 构建时生成,干净检出上先 vet 会因 pattern web 无文件而直接失败。
+# 顺序:genfont(重生成 src/fonts 子集)→ vite(产出 core/web)→ vet/test。
 
-if [ "$skip_tests" = 0 ]; then
-    echo "== go test =="
-    # Mac 上无需 Windows 侧的 testbin 绕防火墙套路,直接跑
-    go test ./...
-fi
+# 图标字体子集:MS_ICONS(webapp/src/lib/icons.js)为唯一事实源,新增图标后
+# 由本步重新生成 woff2。依赖 python3 + fonttools/brotli,首次联网下载全量
+# 字体缓存到 webapp/scripts/.cache(--font 可指定本地 ttf 离线生成)。
+# 失败不阻断构建:沿用已提交的 woff2。
+echo "== Icon font subset =="
+(cd "$core/webapp/scripts" && { python3 genfont.py || python genfont.py; }) \
+    || echo "genfont failed, 沿用已提交字体" >&2
 
 echo "== Web (vite build) =="
 # Vue 前端构建(vue 分支起 UI 源码在 core/webapp,产物写入 core/web 供 go:embed;
@@ -42,13 +45,14 @@ if [ -f "$core/webapp/package.json" ]; then
     (cd "$core/webapp" && OUT_DIR="$core/web" npm run build)
 fi
 
-# 图标字体子集:MS_ICONS(webapp/src/lib/icons.js)为唯一事实源,新增图标后
-# 由本步重新生成 woff2。依赖 python3 + fonttools/brotli,首次联网下载全量
-# 字体缓存到 webapp/scripts/.cache(--font 可指定本地 ttf 离线生成)。
-# 失败不阻断构建:沿用已提交的 woff2。
-echo "== Icon font subset =="
-(cd "$core/webapp/scripts" && { python3 genfont.py || python genfont.py; }) \
-    || echo "genfont failed, 沿用已提交字体" >&2
+echo "== go vet =="
+go vet -tags "desktop,production" ./...
+
+if [ "$skip_tests" = 0 ]; then
+    echo "== go test =="
+    # Mac 上无需 Windows 侧的 testbin 绕防火墙套路,直接跑
+    go test ./...
+fi
 
 # 主图标:仓库根 icon.png 为唯一源,重建扩展图标与 Windows 多尺寸 app.ico
 # (macOS 的 .icns 在下方 bundle 步骤由 genicns 同源生成;换主图标 = 替换 icon.png 后重新构建)

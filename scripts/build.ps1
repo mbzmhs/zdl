@@ -28,6 +28,40 @@ if (-not $go) { throw "Go toolchain not found. Install Go 1.22+ or extract it to
 Write-Host "== Go: $go =="
 & $go version
 
+# Web 构建必须在 vet/test 之前:core/web/(go:embed 嵌入根)已改为不入库、
+# 构建时生成,干净检出上先 vet 会因 pattern web 无文件而直接失败。
+# 顺序:genfont(重生成 src/fonts 子集)→ vite(产出 core/web)→ vet/test。
+
+# 图标字体子集:MS_ICONS(webapp/src/lib/icons.js)为唯一事实源,新增图标后
+# 由本步重新生成 woff2。依赖 python3 + fonttools/brotli,首次联网下载全量
+# 字体缓存到 webapp/scripts/.cache(可用 --font 指定本地 ttf 离线生成)。
+# 失败不阻断构建:沿用已提交的 woff2。
+$webapp = Join-Path $core "webapp"
+Write-Host "== Icon font subset =="
+Push-Location (Join-Path $webapp "scripts")
+try { python genfont.py } catch { Write-Host "genfont 失败(沿用已提交字体): $_" }
+if ($LASTEXITCODE -ne 0) { Write-Host "genfont 失败(沿用已提交字体)" }
+Pop-Location
+
+# Vue 前端构建(vue 分支起 UI 源码在 core/webapp,产物写入 core/web 供 go:embed;
+# 产物带内容哈希文件名,core/web 里不再有 app.js/style.css/fonts 旧文件)
+if (Test-Path (Join-Path $webapp "package.json")) {
+    Write-Host "== Web (vite build) =="
+    Push-Location $webapp
+    try {
+        if (-not (Test-Path (Join-Path $webapp "node_modules"))) {
+            & npm install
+            if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+        }
+        $env:OUT_DIR = Join-Path $core "web"
+        & npm run build
+        if ($LASTEXITCODE -ne 0) { throw "vite build failed" }
+    } finally {
+        Remove-Item Env:OUT_DIR -ErrorAction SilentlyContinue
+        Pop-Location
+    }
+}
+
 Write-Host "== Test =="
 Push-Location $core
 & $go vet ./...
@@ -53,36 +87,6 @@ foreach ($p in $pkgs) {
 }
 }
 # 此处不 Pop:后续 Build 步骤仍需 cwd=core,由原脚本的 Pop-Location 统一收尾
-
-Write-Host "== Build =="
-# Vue 前端构建(vue 分支起 UI 源码在 core/webapp,产物写入 core/web 供 go:embed;
-# 产物带内容哈希文件名,core/web 里不再有 app.js/style.css/fonts 旧文件)
-$webapp = Join-Path $core "webapp"
-if (Test-Path (Join-Path $webapp "package.json")) {
-    Write-Host "== Web (vite build) =="
-    Push-Location $webapp
-    try {
-        if (-not (Test-Path (Join-Path $webapp "node_modules"))) {
-            & npm install
-            if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
-        }
-        $env:OUT_DIR = Join-Path $core "web"
-        & npm run build
-        if ($LASTEXITCODE -ne 0) { throw "vite build failed" }
-    } finally {
-        Remove-Item Env:OUT_DIR -ErrorAction SilentlyContinue
-        Pop-Location
-    }
-}
-# 图标字体子集:MS_ICONS(webapp/src/lib/icons.js)为唯一事实源,新增图标后
-# 由本步重新生成 woff2。依赖 python3 + fonttools/brotli,首次联网下载全量
-# 字体缓存到 webapp/scripts/.cache(可用 --font 指定本地 ttf 离线生成)。
-# 失败不阻断构建:沿用已提交的 woff2。
-Write-Host "== Icon font subset =="
-Push-Location (Join-Path $webapp "scripts")
-try { python genfont.py } catch { Write-Host "genfont 失败(沿用已提交字体): $_" }
-if ($LASTEXITCODE -ne 0) { Write-Host "genfont 失败(沿用已提交字体)" }
-Pop-Location
 # 主图标:仓库根 icon.png 为唯一源,重建扩展图标与多尺寸 app.ico
 # (换主图标 = 替换 icon.png 后重新构建,无需手动跑工具;genicons 零第三方依赖)
 $rootIcon = Join-Path $root "icon.png"
