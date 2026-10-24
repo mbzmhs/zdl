@@ -182,10 +182,24 @@ func TestHandleBTStreamServe(t *testing.T) {
 	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(mid, content[300<<10:300<<10+128<<10]) {
 		t.Fatalf("中段 Range 异常: status=%d body=%s", resp.StatusCode, mid)
 	}
-	// 开放式 Range(播放语义):应拨动游标
-	resp, open := fetch(streamURL, "bytes=0-")
-	if resp.StatusCode != http.StatusPartialContent || len(open) == 0 {
-		t.Fatalf("开放式 Range 异常: status=%d", resp.StatusCode)
+	// 后缀 Range(探测时长/索引):内容比对
+	resp, tail := fetch(streamURL, "bytes=-16384")
+	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(tail, content[len(content)-16384:]) {
+		t.Fatalf("后缀 Range 异常: status=%d len=%d", resp.StatusCode, len(tail))
+	}
+
+	// 后缀 Range 不得抢走游标:下载中的小文件会在请求过程中完成、流模式被
+	// 收尾清除(游标 -1),断言存在完成竞态——持等进入做种态(数据全在、会话
+	// 稳定、无完成竞态)后再验证
+	seedDL := time.Now().Add(25 * time.Second)
+	for time.Now().Before(seedDL) {
+		if v, ok := m.Get(id); ok && v.Status == engine.StatusSeeding {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if v, _ := m.Get(id); v.Status != engine.StatusSeeding {
+		t.Skipf("未进入做种态,跳过游标断言(状态 %s)", v.Status)
 	}
 	cursor := func() int {
 		c, err := http.Get(ts.URL + "/api/tasks/" + id + "/stream/status")
@@ -199,11 +213,15 @@ func TestHandleBTStreamServe(t *testing.T) {
 		c.Body.Close()
 		return st.CursorPiece
 	}
-	// 后缀 Range(探测时长/索引):内容比对 + 不得抢走游标
+	// 开放式 Range(播放语义)拨动游标→后缀 Range 不得抢走
+	resp, open := fetch(streamURL, "bytes=0-")
+	if resp.StatusCode != http.StatusPartialContent || len(open) == 0 {
+		t.Fatalf("开放式 Range 异常: status=%d", resp.StatusCode)
+	}
 	before := cursor()
-	resp, tail := fetch(streamURL, "bytes=-16384")
-	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(tail, content[len(content)-16384:]) {
-		t.Fatalf("后缀 Range 异常: status=%d len=%d", resp.StatusCode, len(tail))
+	resp, tail2 := fetch(streamURL, "bytes=-16384")
+	if resp.StatusCode != http.StatusPartialContent || !bytes.Equal(tail2, content[len(content)-16384:]) {
+		t.Fatalf("做种态后缀 Range 异常: status=%d", resp.StatusCode)
 	}
 	if after := cursor(); after != before {
 		t.Fatalf("后缀 Range 不得抢走游标, %d → %d", before, after)
