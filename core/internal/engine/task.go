@@ -131,6 +131,7 @@ type Task struct {
 	seedStop     chan struct{} // 关闭即停止做种协程
 	arrived      int64         // 已落盘去重字节(运行时实时值;与导出字段 Arrived 同步,随 JSON 持久化)
 	delData      bool          // 删除任务时是否连最终数据一起删(做种协程收尾后执行,避开句柄占用)
+	stream       *taskStream   // 边下边播运行时会话(nil=未开启;见 bt_stream.go,不持久化)
 }
 
 // TaskView 是对外的只读快照(go vet 不允许拷贝含锁结构体)。

@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $core = Join-Path $root "core"
 $dist = Join-Path $root "dist"
-$version = "1.7.3"
+$version = "1.8.0"
 
 # Locate Go: prefer the user toolchain (~\tools\go, 1.27+), then PATH, then Program Files
 $go = $null

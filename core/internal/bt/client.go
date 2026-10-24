@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -190,6 +191,12 @@ type Client struct {
 
 	errMu sync.Mutex
 	errV  error
+
+	// 边下边播:piece 落定广播(闭旧换新;等待方拿当前代 channel select,
+	// 被唤醒后重查可用性)与流模式开关(状态展示用,优先级本体在 picker)。
+	nmu      sync.Mutex
+	nch      chan struct{}
+	streamOn atomic.Bool
 }
 
 type trackerState struct {
@@ -1034,6 +1041,7 @@ func (c *Client) verifyOrDefer(idx int) (ok, parked bool) {
 			c.broadcastHave(p)
 			c.cancelPiece(p)
 		}
+		c.pieceDoneNotify() // v2 整文件落定批量唤醒(流媒体 v2 暂不开放,保持口径一致)
 		// 逐文件完成记账:数据早已落盘,这里统一补记,集齐的文件摘 .!zd 后缀
 		if st := c.store.Load(); st != nil {
 			st.MarkPiecesVerified(pieces...)
@@ -1068,6 +1076,7 @@ func (c *Client) onWholePiece(idx int) {
 	c.picker.ResolveWholePiece(idx)
 	c.broadcastHave(idx)
 	c.cancelPiece(idx)
+	c.pieceDoneNotify() // WebSeed 整片落定同样唤醒流媒体等待方
 	if c.picker.AllDone() {
 		c.finishDownload()
 	}
@@ -2312,6 +2321,7 @@ func (c *Client) onPieceVerified(piece int) {
 	m.Unlock()
 	c.broadcastHave(piece)
 	c.cancelPiece(piece) // 该 piece 已完整,取消所有 peer 对它的在途请求
+	c.pieceDoneNotify()  // 唤醒边下边播等待方(流媒体 handler)
 	if c.picker.AllDone() {
 		c.finishDownload()
 	}
@@ -3112,4 +3122,100 @@ func (c *Client) setErr(err error) {
 	c.errMu.Lock()
 	c.errV = err
 	c.errMu.Unlock()
+}
+
+// ---------- 边下边播 ----------
+
+// pieceDoneNotify 广播一次"有 piece 落定":关闭当前代 channel 并换新。
+// 闭旧换新天然合并多次落定,等待方醒来重查可用性即可,无事件丢失。
+func (c *Client) pieceDoneNotify() {
+	c.nmu.Lock()
+	if c.nch != nil {
+		close(c.nch)
+	}
+	c.nch = make(chan struct{})
+	c.nmu.Unlock()
+}
+
+// StreamWaitSignal 返回当前代的落定广播 channel(被关闭即代表有新落定)。
+func (c *Client) StreamWaitSignal() <-chan struct{} {
+	c.nmu.Lock()
+	defer c.nmu.Unlock()
+	if c.nch == nil {
+		c.nch = make(chan struct{})
+	}
+	return c.nch
+}
+
+// SetStreaming 开启边下边播优先级:pinHead/pinTail 为元数据 piece 区间
+// (文件头/尾,覆盖容器头与 moov/cues 索引),ahead 为播放窗口宽度。
+func (c *Client) SetStreaming(pinHead, pinTail []int, ahead int) {
+	c.picker.EnableStreaming(pinHead, pinTail, ahead)
+	c.streamOn.Store(true)
+}
+
+// ClearStreaming 关闭边下边播优先级,回到纯稀有优先。幂等。
+func (c *Client) ClearStreaming() {
+	c.picker.DisableStreaming()
+	c.streamOn.Store(false)
+}
+
+// Streaming 报告边下边播优先级是否生效。
+func (c *Client) Streaming() bool { return c.streamOn.Load() }
+
+// StreamState 导出流模式优先级状态(播放面板分块图:游标/窗口/深度/pin 区间)。
+func (c *Client) StreamState() (cursor, ahead, depth int, pinHead, pinTail []int, tailOn bool, ok bool) {
+	return c.picker.StreamState()
+}
+
+// SetStreamCursorOff 按全局字节偏移推进播放头(拖动 seek 与顺序播放共用;
+// 每服务完一个 piece 由引擎调用,窗口随播放头滑移)。
+func (c *Client) SetStreamCursorOff(off int64) {
+	if off < 0 {
+		off = 0
+	}
+	c.picker.SetStreamCursor(int(off / c.meta.PieceLength))
+}
+
+// StreamPieceDone 报告覆盖 [off, off+n) 的 piece 是否全部落定(已校验,
+// 数据必在盘上)。流媒体只服务落定 piece:未校验数据可能来自毒源 peer。
+func (c *Client) StreamPieceDone(off, n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	nPieces := c.meta.PieceCount()
+	first := int(off / c.meta.PieceLength)
+	last := int((off + n - 1) / c.meta.PieceLength)
+	if last >= nPieces {
+		last = nPieces - 1
+	}
+	for i := first; i <= last; i++ {
+		if !c.picker.IsDone(i) {
+			return false
+		}
+	}
+	return true
+}
+
+// ErrStreamNotReady 区间尚有未落定 piece(调用方应等待信号后重试)。
+var ErrStreamNotReady = errors.New("流式区间尚未就绪")
+
+// StreamReadOff 读取已落定的数据到 buf(前置 StreamPieceDone)。
+// 文件完成瞬间 renameToBare 关旧句柄开新句柄是合法瞬态(ErrFileClosed),
+// 重取 store 重试一次;其余错误原样上抛。
+func (c *Client) StreamReadOff(off int64, buf []byte) error {
+	if !c.StreamPieceDone(off, int64(len(buf))) {
+		return ErrStreamNotReady
+	}
+	st := c.store.Load()
+	if st == nil {
+		return errors.New("会话未就绪")
+	}
+	err := st.readFileRange(off, buf, false)
+	if errors.Is(err, fs.ErrClosed) {
+		if st2 := c.store.Load(); st2 != nil {
+			err = st2.readFileRange(off, buf, false)
+		}
+	}
+	return err
 }

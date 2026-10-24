@@ -10,6 +10,7 @@ import NewTaskDialog from "./components/NewTaskDialog.vue";
 import BTDialog from "./components/BTDialog.vue";
 import ChooseDialog from "./components/ChooseDialog.vue";
 import Drawer from "./components/Drawer.vue";
+import PlayerPane from "./components/PlayerPane.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import RssPane from "./components/RssPane.vue";
 import RssDialogs from "./components/RssDialogs.vue";
@@ -40,6 +41,7 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onKey));
   <BTDialog />
   <ChooseDialog />
   <Drawer />
+  <PlayerPane />
   <SettingsDialog />
   <RssDialogs />
   <ConfirmBox />

@@ -72,3 +72,8 @@ export function ftPrioTxt(done, size, wanted, running) {
   if (running && done > 0) return { txt: "下载中", cls: "" };
   return { txt: "普通", cls: "" };
 }
+
+// 可边下边播的媒体扩展名(视频为主,音频亦可经 video 元素播放;
+// 与引擎 btMediaExts 口径一致并放宽常见封装)
+const MEDIA_EXTS = /^(mp4|mkv|avi|mov|wmv|flv|ts|m2ts|webm|m4v|rmvb|mpg|mpeg|3gp|vob|mp3|flac|m4a|aac|wav|ogg|opus)$/i;
+export const isMediaFile = f => MEDIA_EXTS.test((f.path[f.path.length - 1] || "").split(".").pop() || "");

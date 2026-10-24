@@ -1,0 +1,231 @@
+<script setup>
+// 边下边播播放面板(全局单例 overlay):video 直连核心端口流端点。
+// - 打开先用 Range: bytes=0-0 探测,失败(未选文件/会话未运行/v2 整校验)
+//   直接展示引擎错误,不进播放器
+// - 播放/缓冲:video 原生 controls;waiting/stalled 显示缓冲提示,
+//   引擎按播放头自动重排 piece 优先级(拖动即新 Range,无需额外上报)
+// - 1s 轮询 /stream/status:分块位图画布展示 已完成分块/引擎窗口带/头尾pin/
+//   下载游标 + 播放头标记线——跳转后一眼对上"要播的位置"与"引擎在优先下哪里"
+// - 关闭即 POST stop 还原纯下载优先级(空闲 5 分钟引擎也会自动回收)
+import { ref, computed, watch, onBeforeUnmount } from "vue";
+import { api, mediaURL } from "../lib/api.js";
+import { store, closeOverlay } from "../store.js";
+import { fmtBytes } from "../lib/fmt.js";
+import Overlay from "./Overlay.vue";
+
+const p = computed(() => store.player);
+const name = computed(() => {
+  const f = p.value?.file || "";
+  return f.includes("/") ? f.split("/").pop() : f;
+});
+const src = computed(() => p.value ? mediaURL(`/api/tasks/${p.value.taskId}/stream?file=${encodeURIComponent(p.value.file)}`) : "");
+
+const ready = ref(false);      // 探测通过,可进播放器
+const errMsg = ref("");        // 探测失败原因(引擎文案)
+const buffering = ref(false);  // video waiting/stalled
+const stat = ref(null);        // /stream/status 快照
+const videoEl = ref(null);     // 播放头位置(timeupdate→分块图标记线)
+const bufCv = ref(null);       // 分块位图画布
+const pendingSeek = ref(false); // seeking→seeked 过渡:红线贴 serveStart 而非均摊
+let pollTimer = 0;
+
+async function probe() {
+  ready.value = false;
+  errMsg.value = "";
+  stat.value = null;
+  try {
+    const resp = await fetch(src.value, { headers: { Range: "bytes=0-0" } });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      errMsg.value = data.error || `HTTP ${resp.status}`;
+      return;
+    }
+    resp.body?.cancel?.(); // 探测连接即刻关闭:播放器会开自己的连接
+    ready.value = true;
+  } catch (e) {
+    errMsg.value = "无法连接流媒体端点: " + (e.message || e);
+  }
+}
+
+async function tick() {
+  if (!p.value) return;
+  try { stat.value = await api("GET", `/api/tasks/${p.value.taskId}/stream/status`); } catch {}
+  drawBuf();
+}
+
+watch(() => p.value && p.value.taskId + "|" + p.value.file, () => {
+  clearInterval(pollTimer);
+  if (p.value) {
+    probe();
+    tick();
+    pollTimer = setInterval(tick, 500);
+  }
+}, { immediate: true });
+onBeforeUnmount(() => clearInterval(pollTimer));
+
+/* ---------------- 分块位图画布 ----------------
+ * 行高 26px:上层 0~22px 画已完成分块(密集时按列合并,全有=实蓝/部分=半蓝,
+ * 同 BitfieldCanvas 口径);窗口带为底色淡蓝;头/尾 pin 区间底部橙色下划线;
+ * 下载游标(引擎窗口起点)=白色细线;播放头(视频时间换算)=红色标记线。
+ * 两条线重合即"引擎已切到所需位置",分开即窗口还在路上。 */
+function drawBuf() {
+  const cv = bufCv.value, s = stat.value;
+  if (!cv || !s || !s.pieces || !(s.lastPiece >= s.firstPiece)) return;
+  let raw;
+  try { raw = atob(s.pieces); } catch { return; }
+  const n = s.lastPiece - s.firstPiece + 1; // 文件区间分块数(位图下标 0 起)
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = cv.clientWidth || cv.parentElement?.clientWidth || 300;
+  if (cv.width !== Math.round(cssW * dpr)) {
+    cv.width = Math.round(cssW * dpr);
+    cv.height = Math.round(26 * dpr);
+  }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = cssW, h = 26;
+  ctx.clearRect(0, 0, w, h);
+  const xOf = i => i / n * w; // 分块下标(文件区间 0 起)→ 像素
+
+  // 引擎优先窗口带 [cursor, cursor+ahead):淡蓝底色;前沿深度带
+  // [cursor, cursor+depth):更亮一档——真正在被集中下载的活动区
+  if (s.cursorPiece >= 0 && s.ahead > 0) {
+    const c = Math.max(0, s.cursorPiece - s.firstPiece);
+    const e = Math.min(n, c + s.ahead);
+    ctx.fillStyle = "rgba(59,130,246,0.10)";
+    ctx.fillRect(xOf(c), 0, xOf(e) - xOf(c), h - 3);
+    if (s.depth > 0) {
+      const de = Math.min(n, c + s.depth);
+      ctx.fillStyle = "rgba(59,130,246,0.20)";
+      ctx.fillRect(xOf(c), 0, xOf(de) - xOf(c), h - 3);
+    }
+  }
+  // 已完成分块(列合并,密集时全有/部分区分)
+  for (let x = 0; x < w; x++) {
+    const st = Math.floor(x * n / w), en = Math.max(st + 1, Math.floor((x + 1) * n / w));
+    let any = false, full = true;
+    for (let i = st; i < en && i < n; i++) {
+      if ((raw.charCodeAt(i >> 3) >> (7 - (i & 7))) & 1) any = true; else full = false;
+    }
+    if (any) {
+      ctx.fillStyle = full ? "#3b82f6" : "rgba(59,130,246,0.45)";
+      ctx.fillRect(x, 1, 1, h - 6);
+    }
+  }
+  // 头/尾元数据 pin 区间:底部橙色下划线(尚未完成的分块更值得关注)
+  const pin = (a, b) => {
+    if (!(a >= 0) || !(b >= a)) return;
+    const i0 = Math.max(0, a - s.firstPiece), i1 = Math.min(n - 1, b - s.firstPiece);
+    if (i1 < i0) return;
+    ctx.fillStyle = "#f59e0b";
+    ctx.fillRect(xOf(i0), h - 4, Math.max(1, xOf(i1 + 1) - xOf(i0)), 2.5);
+  };
+  pin(s.pinHeadFirst, s.pinHeadLast);
+  pin(s.pinTailFirst, s.pinTailLast);
+  // 下载游标(引擎窗口起点):白色细线
+  if (s.cursorPiece >= 0) {
+    const c = s.cursorPiece - s.firstPiece;
+    if (c >= 0 && c < n) {
+      ctx.fillStyle = "rgba(255,255,255,0.9)";
+      ctx.fillRect(Math.min(w - 1, xOf(c)), 0, 1.5, h - 3);
+    }
+  }
+  // 播放头(视频时间→字节):优先用 buffered 时间区间与引擎服务字节区间对齐
+  // 做内插(浏览器解码过 moov/cues 索引,局部码率近似恒定,VBR 下远准于全片
+  // 均摊);拿不到服务区间时回退全片均摊(近似)。
+  const vd = videoEl.value;
+  if (vd && vd.duration > 0 && s.size > 0) {
+    let fileOff = -1;
+    const b = vd.buffered;
+    if (s.serveEnd >= s.serveStart && (s.serveStart > 0 || s.serveEnd > 0)) {
+      for (let i = 0; i < b.length; i++) {
+        if (vd.currentTime >= b.start(i) - 0.05 && vd.currentTime <= b.end(i) + 0.05) {
+          const span = b.end(i) - b.start(i);
+          const t = span > 0 ? Math.min(1, Math.max(0, (vd.currentTime - b.start(i)) / span)) : 0;
+          fileOff = s.serveStart + t * (s.serveEnd - s.serveStart);
+          break;
+        }
+      }
+    }
+    // seek 过渡态(新位置尚无缓冲区间):serveStart 即 seek Range 的落点字节,
+    // 红线贴它比全片均摊(拖动中错位的来源)准得多
+    if (fileOff < 0 && pendingSeek.value && s.serveEnd >= s.serveStart && (s.serveStart > 0 || s.serveEnd > 0)) {
+      fileOff = s.serveStart;
+    }
+    if (fileOff < 0) fileOff = vd.currentTime / vd.duration * s.size;
+    const globalOff = (s.fileOffset || 0) + fileOff;
+    const idx = Math.floor(globalOff / s.pieceLen) - s.firstPiece;
+    if (idx >= 0 && idx < n) {
+      ctx.fillStyle = "#ef4444";
+      ctx.fillRect(Math.min(w - 2, xOf(idx)), 0, 2, h - 3);
+    }
+  }
+}
+
+// 播放头移动即时重画(timeupdate ~4Hz,画布极小无性能压力);
+// seeking 立刻刷新一次状态:seek Range 马上到达,serveStart 即落点字节,
+// 红线贴住它,消除拖动期间回退均摊算法的错位过渡态
+const onTimeUpdate = () => drawBuf();
+const onSeeking = () => { pendingSeek.value = true; tick(); };
+const onSeeked = () => { pendingSeek.value = false; drawBuf(); };
+
+const bufStat = computed(() => {
+  const s = stat.value;
+  if (!s || !s.pieces || !(s.lastPiece >= s.firstPiece)) return null;
+  let bits;
+  try { bits = atob(s.pieces); } catch { return null; }
+  let done = 0;
+  for (let i = 0; i < bits.length; i++) {
+    const b = bits.charCodeAt(i);
+    for (let k = 0; k < 8; k++) if (b & (0x80 >> k)) done++;
+  }
+  const total = s.lastPiece - s.firstPiece + 1;
+  return { pct: Math.min(100, done / total * 100), done, total };
+});
+
+const onVWaiting = () => { buffering.value = true; };
+const onVReady = () => { buffering.value = false; };
+
+async function close() {
+  const id = p.value?.taskId;
+  closeOverlay("playerOverlay");
+  store.player = null;
+  if (id) { try { await api("POST", `/api/tasks/${id}/stream/stop`); } catch {} }
+}
+</script>
+
+<template>
+  <Overlay id="playerOverlay">
+    <div class="dialog player-dialog">
+      <h2><span class="accent-bar"></span>边下边播<span class="dim player-name" :title="p?.file">{{ name }}</span>
+        <button class="icon-btn" style="margin-left:auto" title="关闭" @click="close">✕</button>
+      </h2>
+      <div v-if="errMsg" class="player-error">
+        <p>{{ errMsg }}</p>
+        <p class="dim">可在任务详情的文件页勾选该文件后重试;暂停中的任务恢复运行后再播。</p>
+      </div>
+      <template v-else-if="ready">
+        <div class="player-body">
+          <video ref="videoEl" :src="src" controls autoplay playsinline
+            @waiting="onVWaiting" @stalled="onVWaiting" @timeupdate="onTimeUpdate"
+            @seeking="onSeeking" @seeked="onSeeked"
+            @playing="onVReady" @canplay="onVReady" @pause="onVReady"></video>
+          <div v-if="buffering" class="player-hint">缓冲中…正在优先下载播放位置附近的分块</div>
+        </div>
+        <div class="player-stat">
+          <canvas ref="bufCv" class="piece-canvas"></canvas>
+          <div class="player-legend dim">
+            <span><i class="lg lg-done"></i>已完成</span>
+            <span><i class="lg lg-win"></i>优先窗口</span>
+            <span><i class="lg lg-front"></i>活动前沿</span>
+            <span><i class="lg lg-pin"></i>头尾元数据</span>
+            <span><i class="lg lg-cur"></i>下载游标</span>
+            <span><i class="lg lg-play"></i>播放头</span>
+          </div>
+          <span class="dim">{{ bufStat ? `已缓冲 ${bufStat.pct.toFixed(0)}%(分块 ${bufStat.done}/${bufStat.total})` : "读取缓冲状态…"
+            }}<template v-if="stat"> · {{ fmtBytes(stat.size || 0) }}</template></span>
+        </div>
+      </template>
+      <div v-else class="player-error"><p class="dim">正在连接流媒体端点…</p></div>
+    </div>
+  </Overlay>
+</template>

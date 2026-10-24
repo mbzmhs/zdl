@@ -509,6 +509,7 @@ func (m *Manager) runBT(ctx context.Context, t *Task) error {
 		t.mu.Lock()
 		if t.btcl == cl {
 			t.btcl = nil
+			t.stream = nil // 会话结束,边下边播状态一并作废(读取方将报会话未运行)
 		}
 		t.mu.Unlock()
 	}()
@@ -1103,6 +1104,9 @@ func (m *Manager) btPump(ctx context.Context, t *Task, cl *bt.Client, meta *bt.M
 		if i%30 == 0 { // 每 15 秒持久化位图与上传量
 			m.btSaveBitfieldIfOwned(t, cl, meta)
 		}
+		if i%60 == 30 { // 周期检查边下边播空闲回收(无请求超时还原优先级)
+			m.btStreamIdleReclaim(t, cl)
+		}
 	}
 }
 
@@ -1177,6 +1181,7 @@ func (m *Manager) goSeeding(t *Task, cl *bt.Client) {
 				t.mu.Lock()
 				if t.btcl == cl {
 					t.btcl = nil
+					t.stream = nil
 				}
 				t.mu.Unlock()
 				return
@@ -1186,6 +1191,7 @@ func (m *Manager) goSeeding(t *Task, cl *bt.Client) {
 			if t.btcl == cl {
 				t.Connections = 0 // 会话结束,连接数清零
 				t.btcl = nil
+				t.stream = nil
 			}
 			t.mu.Unlock()
 		}()

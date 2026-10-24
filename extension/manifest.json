@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ZDownloader 助手",
-  "version": "1.7.3",
+  "version": "1.8.0",
   "description": "接管浏览器默认下载,交给 ZDownloader 多线程引擎;嗅探网页中的视频/音频/HLS 流媒体资源。",
   "icons": {
     "16": "icons/icon16.png",
