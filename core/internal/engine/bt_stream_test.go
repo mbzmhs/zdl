@@ -40,19 +40,21 @@ func streamTempDir(t *testing.T) string {
 	return dir
 }
 
-// streamSeedSource 生成单个大文件源(2MB,16KB piece ≈ 128 片),
-// 保证本地回环下仍有可观察的下载中窗口。
-func streamSeedSource(t *testing.T) (root string, torrent []byte, content []byte) {
+// streamSeedSource 生成单文件视频种子源(2MB mp4,16KB piece ≈ 128 片):
+// 以文件路径制种 → 单文件 torrent(meta.Multi=false),顺带覆盖任务卡
+// 快速入口的 streamable 标记;本地回环下仍有可观察的下载中窗口。
+func streamSeedSource(t *testing.T) (srcFile string, torrent []byte, content []byte) {
 	t.Helper()
-	root = streamTempDir(t)
+	dir := streamTempDir(t)
 	content = make([]byte, 2<<20)
 	for i := range content {
 		content[i] = byte(i*7 + i/251)
 	}
-	if err := os.WriteFile(filepath.Join(root, "video.bin"), content, 0o644); err != nil {
+	srcFile = filepath.Join(dir, "video.mp4")
+	if err := os.WriteFile(srcFile, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, meta, err := bt.BuildTorrentFromDisk(root, "", "", 16384)
+	_, meta, err := bt.BuildTorrentFromDisk(srcFile, "", "", 16384)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,7 @@ func streamSeedSource(t *testing.T) (root string, torrent []byte, content []byte
 	if err != nil {
 		t.Fatal(err)
 	}
-	return root, torrent, content
+	return srcFile, torrent, content
 }
 
 func TestBTStreamWhileDownloading(t *testing.T) {
@@ -124,7 +126,7 @@ func TestBTStreamWhileDownloading(t *testing.T) {
 	// 开流:多文件种子按文件相对路径(会话挂载与状态置位有几毫秒差,重试)
 	var info *BTStreamInfo
 	for time.Now().Before(deadline) {
-		info, err = m.BTStreamOpen(id, "video.bin")
+		info, err = m.BTStreamOpen(id, "video.mp4")
 		if err == nil {
 			break
 		}
@@ -139,8 +141,12 @@ func TestBTStreamWhileDownloading(t *testing.T) {
 	if info.Size != int64(len(content)) {
 		t.Fatalf("文件大小不符: %d != %d", info.Size, len(content))
 	}
-	if info.ContentType != "application/octet-stream" {
+	if info.ContentType != "video/mp4" {
 		t.Fatalf("Content-Type 应按扩展名,得到 %q", info.ContentType)
+	}
+	// 单文件视频种子:任务卡快速入口标记
+	if v, ok := m.Get(id); !ok || !v.Streamable {
+		t.Fatal("单文件视频种子应标记 streamable")
 	}
 	// 连接登记 + Range 到达游标
 	seq, err := m.BTStreamConnOpen(id)
@@ -179,7 +185,7 @@ func TestBTStreamWhileDownloading(t *testing.T) {
 
 	// 状态快照:流开着、位图可解码
 	st, err := m.BTStreamStatus(id)
-	if err != nil || !st.Streaming || st.File != "video.bin" || st.Pieces == "" {
+	if err != nil || !st.Streaming || st.File != "video.mp4" || st.Pieces == "" {
 		t.Fatalf("BTStreamStatus 异常: %+v err=%v", st, err)
 	}
 	// 停止:还原优先级,状态回落
@@ -248,7 +254,7 @@ func TestBTStreamOpenGuards(t *testing.T) {
 	}
 	var serr error
 	for time.Now().Before(deadline) {
-		if _, serr = m.BTStreamOpen(id, "video.bin"); serr == nil {
+		if _, serr = m.BTStreamOpen(id, "video.mp4"); serr == nil {
 			break
 		}
 		if !errors.Is(serr, ErrStreamNoSession) {
@@ -300,7 +306,7 @@ func TestBTStreamCursorGating(t *testing.T) {
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err = m.BTStreamOpen(id, "video.bin"); err == nil {
+		if _, err = m.BTStreamOpen(id, "video.mp4"); err == nil {
 			break
 		}
 		if !errors.Is(err, ErrStreamNoSession) {

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"zdownloader/internal/bt"
 )
 
 const (
@@ -110,33 +112,71 @@ func (s *Server) handleBTStream(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, min(info.PieceLen, streamReadBuf))
+	bbuf := make([]byte, bt.BlockSize) // 块级直读缓冲
 	for off := start; off <= end; {
-		n := end - off + 1
-		if pieceLeft := info.PieceLen - off%info.PieceLen; pieceLeft < n {
-			n = pieceLeft // piece 对齐:每轮等待恰覆盖一个 piece
+		// 快路径:off 所在 piece 已落定 → 盘读整段(piece 对齐、受 chunk
+		// 上限约束)。已落定 piece 的数据必在盘上(校验即落盘)。
+		if s.mgr.BTStreamPieceDone(id, off) {
+			n := end - off + 1
+			if pieceLeft := info.PieceLen - off%info.PieceLen; pieceLeft < n {
+				n = pieceLeft
+			}
+			n = min(n, int64(len(buf)), streamWriteChunk)
+			wctx, cancel := context.WithTimeout(r.Context(), streamWaitPiece)
+			werr := s.mgr.BTStreamWait(wctx, id, off, n)
+			cancel()
+			if werr != nil {
+				return
+			}
+			if rerr := s.mgr.BTStreamRead(id, off, buf[:n]); rerr != nil {
+				return
+			}
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			s.mgr.BTStreamServed(id, seq, off+n)
+			off += n
+			continue
 		}
-		n = min(n, int64(len(buf)), streamWriteChunk)
-		wctx, cancel := context.WithTimeout(r.Context(), streamWaitPiece)
-		werr := s.mgr.BTStreamWait(wctx, id, off, n)
-		cancel()
-		if werr != nil {
-			// 超时/断开/会话结束:直接结束响应。播放器视为网络中断会自动
-			// 重试,新 Range 会重新移动游标,语义自洽
-			return
+		// 块级路径:piece 未落定时逐块等待、内存攒块直读(16KB 粒度)——
+		// 首字节不必等整片 SHA-1,大 piece 种子首载大幅提前。溢写 piece
+		// 块状态不可知,WaitBlock 只能等整片,行为退回 piece 粒度。
+		pieceLeft := info.PieceLen - off%info.PieceLen
+		sliceEnd := min(end+1, off+pieceLeft)
+		for off < sliceEnd {
+			local := (info.FileOffset + off) % info.PieceLen
+			n := min(int64(bt.BlockSize)-local%bt.BlockSize, sliceEnd-off)
+			wctx, cancel := context.WithTimeout(r.Context(), streamWaitPiece)
+			pieceDone, arrived, werr := s.mgr.BTStreamWaitBlock(wctx, id, off)
+			cancel()
+			if werr != nil {
+				return // 超时/断开/会话结束:结束响应,播放器重试
+			}
+			if pieceDone {
+				break // 整片恰好落定:跳回快路径盘读本片剩余
+			}
+			if !arrived {
+				return
+			}
+			if !s.mgr.BTStreamBlockRead(id, off, bbuf[:n]) {
+				// 缓冲恰被校验取走:重查整片,落定走盘读、否则重等本块
+				if s.mgr.BTStreamPieceDone(id, off) {
+					break
+				}
+				continue
+			}
+			if _, werr := w.Write(bbuf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			s.mgr.BTStreamServed(id, seq, off+n)
+			off += n
 		}
-		if rerr := s.mgr.BTStreamRead(id, off, buf[:n]); rerr != nil {
-			return
-		}
-		if _, werr := w.Write(buf[:n]); werr != nil {
-			return
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		// 游标随实际服务位置推进(窗口贴住真实播放头;引擎侧按连接归属门控,
-		// 旧连接的滞后吐数不再拖动游标)
-		s.mgr.BTStreamServed(id, seq, off+n)
-		off += n
 	}
 }
 

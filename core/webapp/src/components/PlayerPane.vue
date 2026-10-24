@@ -7,15 +7,17 @@
 // - 1s 轮询 /stream/status:分块位图画布展示 已完成分块/引擎窗口带/头尾pin/
 //   下载游标 + 播放头标记线——跳转后一眼对上"要播的位置"与"引擎在优先下哪里"
 // - 关闭即 POST stop 还原纯下载优先级(空闲 5 分钟引擎也会自动回收)
-import { ref, computed, watch, onBeforeUnmount } from "vue";
+import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
 import { api, mediaURL } from "../lib/api.js";
-import { store, closeOverlay } from "../store.js";
+import { store, ui, closeOverlay } from "../store.js";
 import { fmtBytes } from "../lib/fmt.js";
+import { ms } from "../lib/icons.js";
 import Overlay from "./Overlay.vue";
 
 const p = computed(() => store.player);
+// file 为空 = 单文件种子任务卡快速入口:引擎解析唯一文件;首拍状态回填名称
 const name = computed(() => {
-  const f = p.value?.file || "";
+  const f = p.value?.file || stat.value?.file || "";
   return f.includes("/") ? f.split("/").pop() : f;
 });
 const src = computed(() => p.value ? mediaURL(`/api/tasks/${p.value.taskId}/stream?file=${encodeURIComponent(p.value.file)}`) : "");
@@ -28,6 +30,7 @@ const videoEl = ref(null);     // 播放头位置(timeupdate→分块图标记�
 const bufCv = ref(null);       // 分块位图画布
 const pendingSeek = ref(false); // seeking→seeked 过渡:红线贴 serveStart 而非均摊
 let pollTimer = 0;
+let cleaning = false; // 收尾单次保护(须先于下方 p-watch 声明:immediate 回调同步执行)
 
 async function probe() {
   ready.value = false;
@@ -56,6 +59,7 @@ async function tick() {
 watch(() => p.value && p.value.taskId + "|" + p.value.file, () => {
   clearInterval(pollTimer);
   if (p.value) {
+    cleaning = false; // 新会话:重置收尾保护
     probe();
     tick();
     pollTimer = setInterval(tick, 500);
@@ -185,19 +189,95 @@ const bufStat = computed(() => {
 const onVWaiting = () => { buffering.value = true; };
 const onVReady = () => { buffering.value = false; };
 
-async function close() {
+/* ---------------- 真全屏 ----------------
+ * 桌面(Wails)内用窗口级全屏(WindowFullscreen/Unfullscreen,Windows/macOS
+ * 均原生支持,退出自动还原窗体);浏览器内回退 video 元素全屏。
+ * 双击拦截默认行为(WebView2 的元素全屏只能填满应用窗口)。 */
+const fsByApp = ref(false);
+const wailsRuntime = () => (typeof window !== "undefined" && window.runtime && window.runtime.WindowFullscreen)
+  ? window.runtime : null;
+
+async function toggleFullscreen() {
+  const rt = wailsRuntime();
+  if (rt) {
+    if (!fsByApp.value) {
+      await rt.WindowFullscreen();
+      fsByApp.value = true;
+    } else {
+      await rt.WindowUnfullscreen();
+      fsByApp.value = false;
+    }
+    return;
+  }
+  const vd = videoEl.value;
+  if (!vd) return;
+  if (!document.fullscreenElement) await vd.requestFullscreen().catch(() => {});
+  else await document.exitFullscreen().catch(() => {});
+}
+const onDblClick = e => { e.preventDefault(); toggleFullscreen(); };
+const fsActive = computed(() => fsByApp.value || elFs.value);
+
+// WebView2 的原生双击全屏无法被 preventDefault 抑制(实测双击会与我们自己的
+// 切换同时触发元素全屏,窗口全屏随即被误关):桌面(Wails)环境把元素全屏
+// 一律"吸收"掉——仅退出、绝不切换,窗口级全屏的进/出统一由双击和自家
+// 按钮负责。原生全屏按钮已用 CSS 隐藏。浏览器环境保持原生元素全屏。
+const elFs = ref(false); // 元素全屏态(浏览器环境图标切换用)
+function onDocFsChange() {
+  elFs.value = !!document.fullscreenElement;
+  if (!wailsRuntime() || !document.fullscreenElement) return;
+  document.exitFullscreen().catch(() => {});
+}
+onMounted(() => document.addEventListener("fullscreenchange", onDocFsChange));
+
+// Esc 语义分层:全屏态第一次 Esc 只退全屏,再按才关面板。App 的全局 Esc
+// 关闭最上层 overlay 是 bubble 阶段的 document 监听,这里以 capture 阶段
+// 监听拦截并 stopPropagation,抢在它之前(浏览器元素全屏下 Esc 通常被浏览器
+// 自行消费退出、走不到这里;Wails 窗口全屏必经此处)。
+function onKeydown(e) {
+  if (e.key !== "Escape") return;
+  if (elFs.value) { e.stopPropagation(); e.preventDefault(); document.exitFullscreen().catch(() => {}); return; }
+  if (fsByApp.value) { e.stopPropagation(); e.preventDefault(); toggleFullscreen(); }
+}
+onMounted(() => document.addEventListener("keydown", onKeydown, true));
+
+// 统一收尾:停流播、还原窗口全屏。close() 与"Esc/遮罩关闭 overlay"两条
+// 路径都走到这里(后者绕过组件方法,靠 overlay 标志位 watch 兜住)
+async function cleanup() {
+  if (cleaning) return;
+  cleaning = true;
   const id = p.value?.taskId;
-  closeOverlay("playerOverlay");
   store.player = null;
+  if (fsByApp.value) {
+    fsByApp.value = false;
+    const rt = wailsRuntime();
+    if (rt) await rt.WindowUnfullscreen().catch(() => {});
+  }
   if (id) { try { await api("POST", `/api/tasks/${id}/stream/stop`); } catch {} }
 }
+watch(() => ui.flags.playerOverlay, shown => {
+  if (!shown && p.value) cleanup();
+});
+async function close() {
+  closeOverlay("playerOverlay");
+  await cleanup();
+}
+onBeforeUnmount(() => {
+  clearInterval(pollTimer);
+  document.removeEventListener("fullscreenchange", onDocFsChange);
+  document.removeEventListener("keydown", onKeydown, true);
+  if (p.value) cleanup();
+});
 </script>
 
 <template>
   <Overlay id="playerOverlay">
-    <div class="dialog player-dialog">
+    <div class="dialog player-dialog" :class="{ 'player-fs': fsByApp }">
       <h2><span class="accent-bar"></span>边下边播<span class="dim player-name" :title="p?.file">{{ name }}</span>
-        <button class="icon-btn" style="margin-left:auto" title="关闭" @click="close">✕</button>
+        <span class="player-h2-actions">
+          <button class="icon-btn" :title="fsActive ? '退出全屏' : '全屏'" @click="toggleFullscreen"
+            v-html="fsActive ? ms('fullscreen_exit') : ms('fullscreen')"></button>
+          <button class="icon-btn" style="margin-left:0" title="关闭" @click="close">✕</button>
+        </span>
       </h2>
       <div v-if="errMsg" class="player-error">
         <p>{{ errMsg }}</p>
@@ -207,7 +287,7 @@ async function close() {
         <div class="player-body">
           <video ref="videoEl" :src="src" controls autoplay playsinline
             @waiting="onVWaiting" @stalled="onVWaiting" @timeupdate="onTimeUpdate"
-            @seeking="onSeeking" @seeked="onSeeked"
+            @seeking="onSeeking" @seeked="onSeeked" @dblclick="onDblClick"
             @playing="onVReady" @canplay="onVReady" @pause="onVReady"></video>
           <div v-if="buffering" class="player-hint">缓冲中…正在优先下载播放位置附近的分块</div>
         </div>

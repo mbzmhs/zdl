@@ -271,6 +271,11 @@ func (m *Manager) fillBTTaskFromMeta(t *Task, meta *bt.MetaInfo) {
 		}
 	}
 	t.AcceptRanges = true // BT 恒可续传
+	// 单文件视频种子:任务列表文件名可作边下边播快速入口(前端据 streamable
+	// 渲染点击;多文件种子走详情文件树)。文件被改选排除时不开入口。
+	t.Streamable = !meta.Multi && len(meta.Files) == 1 &&
+		btMediaExts[strings.ToLower(filepath.Ext(meta.Name))] &&
+		(len(t.WantedFiles) == 0 || btNormPath(t.WantedFiles[0]) == meta.Name)
 	// 种子内置 tracker 并入任务列表(详情展示与重启用)
 	has := map[string]bool{}
 	for _, u := range t.Trackers {

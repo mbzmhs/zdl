@@ -42,6 +42,14 @@ if [ -f "$core/webapp/package.json" ]; then
     (cd "$core/webapp" && OUT_DIR="$core/web" npm run build)
 fi
 
+# 图标字体子集:MS_ICONS(webapp/src/lib/icons.js)为唯一事实源,新增图标后
+# 由本步重新生成 woff2。依赖 python3 + fonttools/brotli,首次联网下载全量
+# 字体缓存到 webapp/scripts/.cache(--font 可指定本地 ttf 离线生成)。
+# 失败不阻断构建:沿用已提交的 woff2。
+echo "== Icon font subset =="
+(cd "$core/webapp/scripts" && { python3 genfont.py || python genfont.py; }) \
+    || echo "genfont failed, 沿用已提交字体" >&2
+
 # 主图标:仓库根 icon.png 为唯一源,重建扩展图标与 Windows 多尺寸 app.ico
 # (macOS 的 .icns 在下方 bundle 步骤由 genicns 同源生成;换主图标 = 替换 icon.png 后重新构建)
 if [ -f "$root/icon.png" ]; then

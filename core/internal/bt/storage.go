@@ -3,6 +3,7 @@ package bt
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -540,6 +541,45 @@ func (s *Storage) ReadForUpload(off int64, p []byte) error {
 	return s.readFileRange(off, p, true)
 }
 
+// StreamBlockState 返回 piece 的块级到货位图(内存攒块,块粒度流播用)。
+// buffered=false:不在内存缓冲(未开始/已溢写/已被校验取走/存储已关闭)——
+// 溢写后的 piece 块级状态不可知(数据直写盘、位图不再维护),调用方回退
+// piece 级等待;piece 已落定的数据在盘上,同样返回 false。
+func (s *Storage) StreamBlockState(piece int) (have []bool, buffered bool) {
+	s.pbMu.Lock()
+	defer s.pbMu.Unlock()
+	if s.pbufs == nil {
+		return nil, false
+	}
+	pb := s.pbufs[piece]
+	if pb == nil || pb.spill {
+		return nil, false
+	}
+	return pb.have, true
+}
+
+// StreamBlockRead 从内存攒块缓冲拷贝一段已到货数据(localOff 为 piece 内
+// 偏移,调用方保证所在块已到货且区间不跨块)。位图检查与拷贝同持 pbMu,
+// 不会读到半块。缓冲被校验路径取走/溢写时返回 false,调用方应重查 piece
+// 是否已落定改走盘读。
+func (s *Storage) StreamBlockRead(piece, localOff int, dst []byte) bool {
+	s.pbMu.Lock()
+	defer s.pbMu.Unlock()
+	if s.pbufs == nil {
+		return false
+	}
+	pb := s.pbufs[piece]
+	if pb == nil || pb.spill {
+		return false
+	}
+	bi := localOff / BlockSize
+	if bi >= len(pb.have) || !pb.have[bi] {
+		return false
+	}
+	copy(dst, pb.buf[localOff:localOff+len(dst)])
+	return true
+}
+
 // Finalize 在全部需求 piece 校验通过后调用:补摘残留的 .!zd 后缀(校验
 // 通过瞬间改名失败——例如文件被播放器占用——的在这里重试)。就地布局
 // 没有整体改名这一步,数据自始至终都在最终路径上。返回最终落定路径。
@@ -641,52 +681,66 @@ func (s *Storage) fileOnDisk(i int) bool {
 // 读路径【绝不创建文件】:否则改选重启的恢复扫描会经跨界 piece 给未选
 // 邻居凭空造出 0 字节 .!zd 残留(实测 [BeanSub] 随身 s4 任务一次改选冒
 // 出 4 个)。
+// readFileRange 重试外层:文件完成瞬间 renameToBare 关旧句柄开新句柄是
+// 合法瞬态,本函数取句柄后释放锁再 ReadAt,恰逢切换会得到一次 ErrClosed。
+// 上传(ReadForUpload)/校验(verifyPieceInner)/流播三条读路径共用此处,
+// 撞上即整体重读一次(重取新句柄);切换只在逐文件完成时发生一次,二次
+// 撞上几乎不可达。
 func (s *Storage) readFileRange(off int64, p []byte, strict bool) error {
-	pos := 0
-	for pos < len(p) {
-		i := s.fileIndexFor(off + int64(pos))
-		if i < 0 {
-			return errors.New("偏移越界")
-		}
-		f := s.meta.Files[i]
-		inFile := off + int64(pos) - f.Offset
-		n := min(int64(len(p)-pos), f.Length-inFile)
-		if n <= 0 {
-			return errors.New("读取长度非法")
-		}
-		if s.pad != nil && s.pad[i] {
-			// 填充文件:内容保证全零,直接补零返回(严格模式也不例外——
-			// 做种服务跨界 piece 时就该发零,数据本身是种子哈希的一部分)
-			clear(p[pos : pos+int(n)])
-			pos += int(n)
-			continue
-		}
-		s.fhMu.RLock()
-		fh := s.fhs[i]
-		s.fhMu.RUnlock()
-		if fh == nil && !s.fileOnDisk(i) {
-			if strict || s.ro {
-				return fmt.Errorf("文件未落盘: %s", f.Path[len(f.Path)-1])
+	for attempt := 0; ; attempt++ {
+		closed := false
+		pos := 0
+		for pos < len(p) {
+			i := s.fileIndexFor(off + int64(pos))
+			if i < 0 {
+				return errors.New("偏移越界")
 			}
-			clear(p[pos : pos+int(n)]) // 从未写入:视为零(旧零预分配语义)
-			pos += int(n)
-			continue
-		}
-		if fh == nil {
-			s.fhMu.Lock()
-			if err := s.ensureFile(i); err != nil {
+			f := s.meta.Files[i]
+			inFile := off + int64(pos) - f.Offset
+			n := min(int64(len(p)-pos), f.Length-inFile)
+			if n <= 0 {
+				return errors.New("读取长度非法")
+			}
+			if s.pad != nil && s.pad[i] {
+				// 填充文件:内容保证全零,直接补零返回(严格模式也不例外——
+				// 做种服务跨界 piece 时就该发零,数据本身是种子哈希的一部分)
+				clear(p[pos : pos+int(n)])
+				pos += int(n)
+				continue
+			}
+			s.fhMu.RLock()
+			fh := s.fhs[i]
+			s.fhMu.RUnlock()
+			if fh == nil && !s.fileOnDisk(i) {
+				if strict || s.ro {
+					return fmt.Errorf("文件未落盘: %s", f.Path[len(f.Path)-1])
+				}
+				clear(p[pos : pos+int(n)]) // 从未写入:视为零(旧零预分配语义)
+				pos += int(n)
+				continue
+			}
+			if fh == nil {
+				s.fhMu.Lock()
+				if err := s.ensureFile(i); err != nil {
+					s.fhMu.Unlock()
+					return err
+				}
+				fh = s.fhs[i]
 				s.fhMu.Unlock()
+			}
+			if _, err := fh.ReadAt(p[pos:pos+int(n)], inFile); err != nil {
+				if errors.Is(err, fs.ErrClosed) && attempt == 0 {
+					closed = true // 句柄切换瞬态:重取句柄整体重读
+					break
+				}
 				return err
 			}
-			fh = s.fhs[i]
-			s.fhMu.Unlock()
+			pos += int(n)
 		}
-		if _, err := fh.ReadAt(p[pos:pos+int(n)], inFile); err != nil {
-			return err
+		if !closed {
+			return nil
 		}
-		pos += int(n)
 	}
-	return nil
 }
 
 func (s *Storage) writeRange(off int64, p []byte) error {

@@ -31,8 +31,10 @@ var (
 	// ErrStreamV2Deferred v2 磁力缺 piece layers:整文件延迟校验,piece
 	 // 永不"落定",流会无限等待,直接拒绝。
 	ErrStreamV2Deferred = errors.New("该文件需整体校验,暂不支持边下边播")
-	// ErrStreamNoSession 任务没有运行中的会话(暂停/错误/已完成)。
+	// ErrStreamNoSession 任务没有运行中的会话(暂停/错误)。
 	ErrStreamNoSession = errors.New("会话未运行,无法边下边播")
+	// ErrStreamCompleted 任务已完成:数据全在盘上,直接打开文件即可。
+	ErrStreamCompleted = errors.New("任务已完成,请直接打开文件")
 )
 
 // btMediaExts 可边下边播的媒体扩展名(默认文件挑选与前端播放入口共用口径)。
@@ -97,6 +99,8 @@ type BTStreamInfo struct {
 	PieceLen    int64  `json:"pieceLen"`
 	FirstPiece  int    `json:"firstPiece"`
 	LastPiece   int    `json:"lastPiece"`
+	// FileOffset 文件在种子内的全局起始偏移(服务循环做 piece 内块定位)。
+	FileOffset int64 `json:"fileOffset,omitempty"`
 }
 
 // BTStreamStatus 流播状态(前端缓冲可视化/播放面板)。
@@ -203,7 +207,7 @@ func (m *Manager) BTStreamOpen(id, file string) (*BTStreamInfo, error) {
 	}
 	if status != StatusRunning && status != StatusSeeding {
 		if status == StatusCompleted {
-			return nil, errors.New("任务已完成,请直接打开文件")
+			return nil, ErrStreamCompleted
 		}
 		return nil, ErrStreamNoSession
 	}
@@ -312,6 +316,7 @@ func (m *Manager) BTStreamOpen(id, file string) (*BTStreamInfo, error) {
 		PieceLen:    st.pieceLen,
 		FirstPiece:  st.first,
 		LastPiece:   st.last,
+		FileOffset:  st.off,
 	}, nil
 }
 
@@ -456,6 +461,71 @@ func (m *Manager) BTStreamWait(ctx context.Context, id string, fileOff, n int64)
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// BTStreamPieceDone 立即检查 fileOff 所在 piece 是否已落定(盘可读)。
+func (m *Manager) BTStreamPieceDone(id string, fileOff int64) bool {
+	t := m.get(id)
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	st, cl := t.stream, t.btcl
+	t.mu.Unlock()
+	if st == nil || cl == nil {
+		return false
+	}
+	return cl.StreamPieceDone(st.off+fileOff, 1)
+}
+
+// BTStreamWaitBlock 块粒度流播等待:阻塞至 fileOff 所在块可用——整片
+// 落定(pieceDone=true,走盘读)或该块已内存到货(arrived=true,走攒块
+// 直读,不必等整片 SHA-1)。溢写/未开始的 piece 块状态不可知,只能等
+// 整片(退回 piece 粒度,行为同旧版)。先取信号再查状态,无丢事件窗口。
+func (m *Manager) BTStreamWaitBlock(ctx context.Context, id string, fileOff int64) (pieceDone, arrived bool, err error) {
+	t := m.get(id)
+	if t == nil {
+		return false, false, ErrNotFound
+	}
+	t.mu.Lock()
+	st, cl := t.stream, t.btcl
+	t.mu.Unlock()
+	if st == nil || cl == nil {
+		return false, false, ErrStreamNoSession
+	}
+	g := st.off + fileOff
+	for {
+		sig := cl.StreamWaitSignal()
+		if cl.StreamPieceDone(g, 1) {
+			return true, false, nil
+		}
+		if cl.StreamBlockArrived(g) {
+			return false, true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, false, ctx.Err()
+		case <-sig:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// BTStreamBlockRead 内存攒块直读:拷贝 fileOff 起 len(buf) 字节(调用方
+// 保证块已到货且不跨块)。false=缓冲恰被校验取走等,调用方重查 piece
+// 落定后改走盘读。
+func (m *Manager) BTStreamBlockRead(id string, fileOff int64, buf []byte) bool {
+	t := m.get(id)
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	st, cl := t.stream, t.btcl
+	t.mu.Unlock()
+	if st == nil || cl == nil {
+		return false
+	}
+	return cl.StreamBlockRead(st.off+fileOff, buf)
 }
 
 // BTStreamRead 读取文件内偏移的一段数据到 buf(前置 BTStreamWait 通过;

@@ -1365,3 +1365,27 @@ html.theme-anim *::before, html.theme-anim *::after {
 .player-error { padding: 26px 8px; text-align: center; }
 .player-error p { margin: 6px 0; font-size: 13.5px; }
 .lg-front { background: rgba(59, 130, 246, 0.34); }
+
+/* 任务卡:可边下边播的文件名(play 徽记 + 悬停点亮) */
+.task-title .name.streamable { color: var(--accent, #4f8eff); }
+.task-title .name.streamable .name-play { margin-left: 6px; vertical-align: -2.5px; opacity: 0.55; font-size: 14px; }
+.task-title .name.streamable:hover .name-play { opacity: 1; }
+.task-title .name .name-play .ms { font-size: 14px; }
+
+/* 播放面板窗口级全屏(Wails):对话框铺满,视频撑到窗口高 */
+.dialog.player-fs {
+  width: 100vw; max-width: none; height: 100vh; max-height: none;
+  border-radius: 0; padding: 10px 14px 12px; display: flex; flex-direction: column;
+}
+.player-fs .player-body { flex: 1; min-height: 0; display: flex; }
+.player-fs .player-body video { max-height: none; height: 100%; flex: 1; }
+.player-fs .player-stat { margin-top: 8px; }
+
+/* 播放器:隐藏原生全屏按钮(桌面无法接管其事件,统一走自家按钮/双击) */
+.player-body video::-webkit-media-controls-fullscreen-button { display: none !important; }
+
+/* 播放器标题栏动作区 */
+.player-h2-actions { margin-left: auto; display: inline-flex; gap: 4px; align-items: center; }
+
+/* 窗口级全屏:隐去标题与统计行,纯视频(退出走双击/Esc) */
+.dialog.player-fs h2, .dialog.player-fs .player-stat { display: none; }

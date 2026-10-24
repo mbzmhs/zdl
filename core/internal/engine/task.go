@@ -132,6 +132,7 @@ type Task struct {
 	arrived      int64         // 已落盘去重字节(运行时实时值;与导出字段 Arrived 同步,随 JSON 持久化)
 	delData      bool          // 删除任务时是否连最终数据一起删(做种协程收尾后执行,避开句柄占用)
 	stream       *taskStream   // 边下边播运行时会话(nil=未开启;见 bt_stream.go,不持久化)
+	Streamable   bool          `json:"-"` // 单文件视频种子:任务列表文件名即边下边播快速入口(元数据就绪时计算)
 }
 
 // TaskView 是对外的只读快照(go vet 不允许拷贝含锁结构体)。
@@ -174,6 +175,8 @@ type TaskView struct {
 	Arrived     int64    `json:"arrived,omitempty"` // BT:已落盘去重字节(进度条口径;HTTP/HLS 恒 0,UI 回退 downloaded)
 	// TorrentFile 用户可见的 .torrent 副本路径(磁力 choosing 任务;UI 预填创建对话框)
 	TorrentFile string `json:"torrentFile,omitempty"`
+	// Streamable 单文件视频种子:文件名可点击直达边下边播(需 running/seeding)
+	Streamable bool `json:"streamable,omitempty"`
 }
 
 func (t *Task) partPath() string  { return filepath.Join(t.Dir, t.Filename+".zdl.part") }
@@ -198,6 +201,7 @@ func (t *Task) View() TaskView {
 		UPLimit: t.UPLimit, SeedRatio: t.SeedRatio, SeedMinutes: t.SeedMinutes,
 		PiecesTotal: t.PiecesTotal, PiecesDone: t.PiecesDone, Arrived: t.arrived,
 		TorrentFile: t.TorrentFile,
+		Streamable:  t.Streamable,
 	}
 }
 

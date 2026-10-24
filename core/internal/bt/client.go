@@ -3126,8 +3126,9 @@ func (c *Client) setErr(err error) {
 
 // ---------- 边下边播 ----------
 
-// pieceDoneNotify 广播一次"有 piece 落定":关闭当前代 channel 并换新。
-// 闭旧换新天然合并多次落定,等待方醒来重查可用性即可,无事件丢失。
+// pieceDoneNotify 广播一次"有新数据到达"(块到货或 piece 落定):关闭当前
+// 代 channel 并换新。闭旧换新天然合并多次到达,等待方醒来重查可用性即可,
+// 无事件丢失。块粒度流播依赖块级通知,piece 级等待方被多唤醒无害。
 func (c *Client) pieceDoneNotify() {
 	c.nmu.Lock()
 	if c.nch != nil {
@@ -3137,7 +3138,8 @@ func (c *Client) pieceDoneNotify() {
 	c.nmu.Unlock()
 }
 
-// StreamWaitSignal 返回当前代的落定广播 channel(被关闭即代表有新落定)。
+// StreamWaitSignal 返回当前代的数据到达广播 channel(被关闭即代表有块
+// 到货或 piece 落定)。
 func (c *Client) StreamWaitSignal() <-chan struct{} {
 	c.nmu.Lock()
 	defer c.nmu.Unlock()
@@ -3199,6 +3201,38 @@ func (c *Client) StreamPieceDone(off, n int64) bool {
 
 // ErrStreamNotReady 区间尚有未落定 piece(调用方应等待信号后重试)。
 var ErrStreamNotReady = errors.New("流式区间尚未就绪")
+
+// StreamBlockArrived 报告全局偏移 off 所在块是否已到货(未校验,内存攒块
+// 位图)。溢写/未开始的 piece 块级状态不可知,返回 false——调用方(块级
+// 等待循环)会转而等整片落定,行为退回 piece 粒度。
+func (c *Client) StreamBlockArrived(off int64) bool {
+	st := c.store.Load()
+	if st == nil {
+		return false
+	}
+	piece := int(off / c.meta.PieceLength)
+	local := int(off % c.meta.PieceLength)
+	have, ok := st.StreamBlockState(piece)
+	if !ok {
+		return false
+	}
+	bi := local / BlockSize
+	return bi < len(have) && have[bi]
+}
+
+// StreamBlockRead 从内存攒块直读一段未校验数据到 dst(off 为全局偏移,
+// 调用方保证所在块已到货且区间不跨块)。块粒度流播:首字节不必等整片
+// SHA-1。拷贝失败(缓冲恰被校验取走等)返回 false,调用方重查 piece
+// 落定后改走盘读。
+func (c *Client) StreamBlockRead(off int64, dst []byte) bool {
+	st := c.store.Load()
+	if st == nil {
+		return false
+	}
+	piece := int(off / c.meta.PieceLength)
+	local := int(off % c.meta.PieceLength)
+	return st.StreamBlockRead(piece, local, dst)
+}
 
 // StreamReadOff 读取已落定的数据到 buf(前置 StreamPieceDone)。
 // 文件完成瞬间 renameToBare 关旧句柄开新句柄是合法瞬态(ErrFileClosed),
