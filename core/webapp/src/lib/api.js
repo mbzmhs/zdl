@@ -23,3 +23,7 @@ export function initSSEBase(cfg) {
 }
 
 export const sseURL = () => SSE_BASE + "/api/events";
+
+// 媒体流地址同样须直连核心真实端口(Wails 窗口内页面源是 wails.localhost,
+// 资产中间件不代理大流量响应;CORS 已放行,浏览器内保持同源)
+export const mediaURL = path => SSE_BASE + path;

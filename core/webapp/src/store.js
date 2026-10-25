@@ -22,6 +22,11 @@ export const store = reactive({
   // (顶栏按钮/任务卡动作/Go 侧 window.__* 入口)
   actions: {},
   detailId: null, // 详情抽屉当前任务(任务被删时由 acceptTick 自动关抽屉)
+  // 打开详情抽屉时直落的页签(空 = 概览;任务卡多文件 BT 标题写入 "files")
+  pendingTab: "",
+  // 边下边播播放面板(单例):{ taskId, file } — FileTree 播放按钮写入,
+  // PlayerPane 消费;关闭时置回 null
+  player: null,
 });
 
 /* ---------------- Overlay 栈 ----------------
@@ -32,7 +37,7 @@ const OVERLAY_RANK = [
   "newTaskOverlay", "btOverlay", "chooseOverlay", "settingsOverlay",
   "rssFeedOverlay", "rssFolderOverlay", "rssPrevOverlay", "bansOverlay",
   "drawerOverlay", "trOverlay", "trAddOverlay", "clientBLOverlay",
-  "peerAddOverlay", "trLogOverlay", "confirmOverlay",
+  "peerAddOverlay", "trLogOverlay", "playerOverlay", "confirmOverlay",
 ];
 export const ui = reactive({ flags: {}, stack: [] });
 

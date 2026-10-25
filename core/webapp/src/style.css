@@ -1325,3 +1325,116 @@ html.theme-anim *::before, html.theme-anim *::after {
   background: #fff;
 }
 .prev-frame iframe { display: block; width: 100%; height: 100%; border: 0; }
+
+/* ---------------- 边下边播 ---------------- */
+/* 文件树行内播放按钮:默认低调,悬停行时点亮 */
+.ftable .ft-play {
+  margin-left: 8px; padding: 0 4px; border: none; border-radius: 5px; cursor: pointer;
+  background: transparent; color: var(--text-faint); vertical-align: -3px; line-height: 1;
+  opacity: 0; transition: opacity 0.12s ease, background 0.12s ease;
+}
+.ftable .ft-row:hover .ft-play { opacity: 1; }
+.ftable .ft-play:hover { color: var(--accent, #4f8ef7); background: rgba(127, 127, 127, 0.12); }
+.ftable .ft-play .ms { font-size: 15px; vertical-align: -2.5px; }
+
+.player-dialog {
+  width: min(920px, calc(100vw - 48px)); max-height: calc(100vh - 40px); overflow-y: auto;
+  /* 视频区恒定高度(带剧集列表时收紧):视频未加载 metadata 前元素自身只有
+   * 默认 150px 高,加载后随宽高比跳变——固定盒高 + 内容 object-fit:contain
+   * (video 默认)信箱化,连接中/出错占位同高,面板尺寸全程恒定 */
+  --pl-video-h: min(56vh, 500px);
+}
+.player-dialog.has-pl { --pl-video-h: min(48vh, 430px); }
+.player-name { font-size: 13px; font-weight: 400; margin-left: 6px; max-width: 46%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.player-body { position: relative; }
+.player-body video {
+  width: 100%; height: var(--pl-video-h); display: block; background: #000;
+  border-radius: 8px; outline: none;
+}
+.player-dialog .player-error {
+  height: var(--pl-video-h); display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+}
+.player-hint {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  padding: 8px 16px; border-radius: 999px; font-size: 12.5px;
+  background: rgba(0, 0, 0, 0.62); color: #fff; pointer-events: none;
+  backdrop-filter: blur(3px);
+}
+.player-stat { display: flex; flex-direction: column; gap: 7px; margin-top: 12px; font-size: 12px; }
+.piece-canvas { width: 100%; height: 26px; display: block; border-radius: 4px;
+  background: rgba(127, 127, 127, 0.10); }
+.player-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11.5px; align-items: center; }
+.player-legend .lg { display: inline-block; width: 10px; height: 10px; border-radius: 2.5px;
+  margin-right: 5px; vertical-align: -1px; }
+.lg-done { background: #3b82f6; }
+.lg-win { background: rgba(59, 130, 246, 0.18); box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.5); }
+.lg-pin { background: linear-gradient(to top, #f59e0b 3px, transparent 3px); box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.35); }
+.lg-cur { background: linear-gradient(to right, rgba(255,255,255,0.9) 1.5px, transparent 1.5px); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.2); }
+.lg-play { background: linear-gradient(to right, #ef4444 2px, transparent 2px); box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.3); }
+.player-error { padding: 26px 8px; text-align: center; }
+.player-error p { margin: 6px 0; font-size: 13.5px; }
+.lg-front { background: rgba(59, 130, 246, 0.34); }
+
+/* 任务卡:可边下边播的文件名(play 徽记 + 悬停点亮) */
+.task-title .name.streamable { color: var(--accent, #4f8eff); }
+.task-title .name.streamable .name-play { margin-left: 6px; vertical-align: -2.5px; opacity: 0.55; font-size: 14px; }
+.task-title .name.streamable:hover .name-play { opacity: 1; }
+.task-title .name .name-play .ms { font-size: 14px; }
+
+/* 播放面板窗口级全屏(Wails):对话框铺满,视频撑到窗口高 */
+.dialog.player-fs {
+  width: 100vw; max-width: none; height: 100vh; max-height: none;
+  border-radius: 0; padding: 10px 14px 12px; display: flex; flex-direction: column;
+}
+.player-fs .player-body { flex: 1; min-height: 0; display: flex; }
+.dialog.player-fs .player-body video { max-height: none; height: 100%; flex: 1; }
+.player-fs .player-stat { margin-top: 8px; }
+
+/* 播放器:隐藏原生全屏按钮(桌面无法接管其事件,统一走自家按钮/双击) */
+.player-body video::-webkit-media-controls-fullscreen-button { display: none !important; }
+
+/* 播放器标题栏动作区 */
+.player-h2-actions { margin-left: auto; display: inline-flex; gap: 4px; align-items: center; }
+
+/* 窗口级全屏:隐去标题、播放列表与统计行,纯视频(退出走双击/Esc);
+ * 连接中/出错占位盒在此时撑满窗体(与视频一致,避免切集闪动) */
+.dialog.player-fs h2, .dialog.player-fs .player-stat, .dialog.player-fs .player-pl { display: none; }
+.dialog.player-fs .player-error { flex: 1; height: auto; min-height: 0; }
+
+/* 剧集播放列表:竖向、固定三行视口,当前集高亮并居中(无前集贴顶/末集贴底
+ * 由滚动 clamp 自然实现),预热过的集带小红点(切集秒开)。滚动条沿用全局
+ * 主题配色,收窄一档以免挤占行宽 */
+.player-pl {
+  --pl-row: 34px;
+  position: relative; /* 行 offsetTop 以本容器为参照(滚动定位计算的前提) */
+  margin-top: 10px; padding: 4px;
+  height: calc(var(--pl-row) * 3 + 8px); /* 恰好三行:内边距 4px×2 */
+  display: flex; flex-direction: column;
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent;
+}
+.player-pl::-webkit-scrollbar { width: 6px; }
+.player-pl::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; }
+.player-pl::-webkit-scrollbar-track { background: transparent; }
+.pl-item {
+  flex: 0 0 var(--pl-row); display: flex; align-items: center; gap: 8px;
+  padding: 0 10px; border: none; border-radius: 8px; cursor: pointer;
+  background: transparent; color: var(--text-dim); font-size: 12.5px;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.pl-item:hover { background: rgba(127, 127, 127, 0.14); color: var(--text); }
+.pl-item.cur { background: var(--accent); color: #fff; }
+.pl-item .pl-idx { font-size: 10.5px; opacity: 0.75; min-width: 16px; text-align: right; font-variant-numeric: tabular-nums; }
+.pl-item .pl-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.pl-item.warmed::after {
+  content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--warn); flex: 0 0 auto;
+}
+.pl-item.warmed.ready::after { background: var(--ok); } /* 元数据已落定:绿点(切集秒开) */
+.pl-item.cur.warmed::after { background: rgba(255, 255, 255, 0.85); }
+
+/* 统计行尾的实时下载速度:常显;速度不足(迟滞判定)变黄并附码率需求 */
+.pl-speed { color: var(--text-dim); }
+.pl-speed.low { color: var(--warn); font-weight: 500; }

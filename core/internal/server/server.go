@@ -27,7 +27,7 @@ import (
 	"zdownloader/internal/rss"
 )
 
-const Version = "1.7.3"
+const Version = "1.8.0"
 
 type Server struct {
 	mgr    *engine.Manager
@@ -150,6 +150,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/bt", s.handleCreateBT)
 	mux.HandleFunc("POST /api/bt/parse", s.handleBTParse)
 	mux.HandleFunc("POST /api/tasks/{id}/stopseed", s.handleStopSeed)
+	mux.HandleFunc("GET /api/tasks/{id}/stream", s.handleBTStream)
+	mux.HandleFunc("GET /api/tasks/{id}/stream/status", s.handleBTStreamStatus)
+	mux.HandleFunc("POST /api/tasks/{id}/stream/stop", s.handleBTStreamStop)
+	mux.HandleFunc("POST /api/tasks/{id}/stream/warm", s.handleBTStreamWarm)
 	mux.HandleFunc("POST /api/tasks/{id}/files", s.handleTaskFiles)
 	mux.HandleFunc("GET /api/tasks/{id}/detail", s.handleTaskDetail)
 	mux.HandleFunc("POST /api/tasks/{id}/trackers", s.handleTaskTrackers)
@@ -1255,6 +1259,10 @@ func (s *Server) QueueSeedConflict(name, torrentPath, dir string) {
 func statusFor(err error) int {
 	if errors.Is(err, engine.ErrNotFound) || errors.Is(err, rss.ErrNotFound) {
 		return http.StatusNotFound
+	}
+	if errors.Is(err, engine.ErrStreamNotWanted) || errors.Is(err, engine.ErrStreamNoSession) ||
+		errors.Is(err, engine.ErrStreamV2Deferred) || errors.Is(err, engine.ErrStreamStale) {
+		return http.StatusConflict // 前置条件不满足:需扩选/会话未运行/文件不支持/旧代次
 	}
 	return http.StatusBadRequest
 }

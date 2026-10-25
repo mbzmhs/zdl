@@ -1,3 +1,6 @@
+// 字体子集以 MS_ICONS 为唯一事实源:新增图标后重跑
+// webapp/scripts/genfont.py 再生成 woff2(构建脚本已接入,离线/无依赖时
+// 沿用已提交字体)。
 // Material Symbols(自托管子集字体 MS Rounded)码位表与内联 SVG,
 // 逐行对齐旧 app.js 的 MS_ICONS/SVGS。图标的 DOM 形态(<span class="ms">…</span>)
 // 由 style.css 驱动,必须原样保留。
@@ -31,6 +34,8 @@ export const MS_ICONS = {
   delete: "\ue92e",
   pause: "\ue034",
   play_arrow: "\ue037",
+  fullscreen: "\ue5d0",
+  fullscreen_exit: "\ue5d1",
   stop: "\ue047",
   link: "\ue250",
   info: "\ue88e",

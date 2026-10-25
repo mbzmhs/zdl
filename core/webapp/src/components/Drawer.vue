@@ -69,7 +69,9 @@ function openDrawer(id) {
   store.detailId = id;
   dwLimitDirty.value = false; // 新任务打开:输入框按服务端值重建
   dwSelDirty.value = false;
-  switchTab("overview");
+  // 指定落地页签(任务卡多文件 BT 标题 → 文件页),一次性消费后回到默认
+  switchTab(store.pendingTab || "overview");
+  store.pendingTab = "";
   // 速度历史按任务保留;任务删除后残留条目超限时清理
   if (speedHistMap.size > 60) {
     const alive = new Set(store.tasks.map(x => x.id));
@@ -180,6 +182,13 @@ function applyDrawer(d) {
 /* ---------------- 文件页签 ---------------- */
 const t = computed(() => lastDetail.value);
 const isBT = computed(() => t.value?.kind === "bt");
+
+// 边下边播:文件树播放按钮 → 全局播放面板(单例 overlay)
+function playFile(path) {
+  store.player = { taskId: store.detailId, file: path };
+  openOverlay("playerOverlay");
+}
+
 const dwEditable = computed(() => dwFiles.value.length > 0 && t.value?.status !== "canceled");
 const showApply = computed(() => dwEditable.value && dwSelDirty.value && t.value?.status !== "choosing");
 const selStatC = computed(() => {
@@ -781,7 +790,7 @@ defineExpose({ closeDrawer });
           <div id="dwFileList" class="file-list" ref="fileTreeEl">
             <div v-if="!dwHasMeta" class="dim" style="padding:6px 0">{{ t && t.status === 'choosing' ? "正在获取元数据,就绪后弹出创建任务窗口" : "元数据未就绪" }}</div>
             <FileTree v-else ref="fileTree" :files="dwFiles" mode="view" :editable="dwEditable"
-              :task-status="t?.status" :init-id="store.detailId || ''" @change="onFileChange" />
+              :task-status="t?.status" :init-id="store.detailId || ''" @change="onFileChange" @play="playFile" />
           </div>
         </div>
 

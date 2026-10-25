@@ -1686,6 +1686,11 @@ func (m *Manager) ticker(ctx context.Context) {
 		dirty := false
 		for _, t := range m.snapshotTasks() {
 			if !m.stepTaskSpeed(t) {
+				// 完成态任务的直读流会话(btStream done 模式)没有 btPump,
+				// 空闲回收在这里补挂(每 ~15s 一查);运行/做种态仍走 pump 内的钩子
+				if n%30 == 0 {
+					m.btStreamIdleReclaim(t, nil)
+				}
 				continue
 			}
 			dirty = true

@@ -602,6 +602,7 @@ func (pc *peerConn) onPiece(payload []byte) {
 		// 锁外记账会在"最后一块触发的校验"抢先下丢条目(来源统计失真)。
 		// 好块计数不在这里:piece 校验通过时才算数(校验通过才算好块)。
 		pc.cl.recordBlame(int(idx), pc.addr)
+		pc.cl.pieceDoneNotify() // 块级流播:块到货即唤醒边下边播等待方
 	}
 	m.Unlock()
 	if !new {

@@ -4,7 +4,7 @@
 // .ft-row 行 + 恒存在的 .ft-children 容器(折叠=display:none)。
 // 选择状态集中在 sel Map(key=相对路径);目录复选框由后代推导(全勾=勾,部分=半选)。
 import { reactive, computed, watch, h } from "vue";
-import { buildFileTree, ftAgg, ftPieceText, fileIcon, isPaddingFile } from "../lib/filetree.js";
+import { buildFileTree, ftAgg, ftPieceText, fileIcon, isPaddingFile, isMediaFile } from "../lib/filetree.js";
 import { ms } from "../lib/icons.js";
 import { fmtBytes } from "../lib/fmt.js";
 
@@ -20,7 +20,7 @@ export default {
     taskStatus: { type: String, default: "" },
     initId: { type: String, default: "" },     // 变化即重置折叠/勾选(旧 initFileTreeState 语义)
   },
-  emits: ["change"],
+  emits: ["change", "play"],
   setup(props, { emit, expose }) {
     const state = reactive({ sel: new Map(), collapsed: new Set() });
 
@@ -168,10 +168,19 @@ export default {
             onChange: e => check(fp, e.target.checked),
           }));
         }
-        cells.push(h("span", { class: "ft-name", title: fp }, [
+        const nameKids = [
           h("span", { class: "ft-ic", innerHTML: ms(fileIcon(f.path[f.path.length - 1])) }),
           h("span", { class: "nm" }, f.path[f.path.length - 1]),
-        ]));
+        ];
+        // 详情页媒体文件行内嵌播放按钮(边下边播):仅选中下载的文件可播,
+        // 点击冒泡给父组件(Drawer)打开播放面板
+        if (props.mode === "view" && isMediaFile(f) && f.wanted !== false && props.taskStatus !== "canceled") {
+          nameKids.push(h("button", {
+            class: "ft-play", title: "边下边播",
+            onClick: e => { e.stopPropagation(); emit("play", fp); },
+          }, h("span", { class: "ft-play-ic", innerHTML: ms("play_arrow") })));
+        }
+        cells.push(h("span", { class: "ft-name", title: fp }, nameKids));
         cells.push(h("span", { class: "ft-size" }, fmtBytes(f.size)));
         if (props.mode === "view") {
           cells.push(progCell(pct));

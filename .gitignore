@@ -23,3 +23,12 @@ testbin/
 # Vue 前端工程
 node_modules/
 core/webapp/dist/
+
+# 设计文档(本地工作稿,不入库)
+docs/
+
+# 前端编译产物(vite 输出,构建脚本按需重新生成,不入库)
+core/web/
+
+# 图标字体子集工具的全量字体缓存(genfont.py 下载/离线放置)
+core/webapp/scripts/.cache/

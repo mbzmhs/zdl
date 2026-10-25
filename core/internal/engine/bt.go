@@ -271,6 +271,12 @@ func (m *Manager) fillBTTaskFromMeta(t *Task, meta *bt.MetaInfo) {
 		}
 	}
 	t.AcceptRanges = true // BT 恒可续传
+	t.FileCount = len(meta.Files)
+	// 单文件视频种子:任务列表文件名可作边下边播快速入口(前端据 streamable
+	// 渲染点击;多文件种子标题点击进详情文件页)。文件被改选排除时不开入口。
+	t.Streamable = !meta.Multi && len(meta.Files) == 1 &&
+		btMediaExts[strings.ToLower(filepath.Ext(meta.Name))] &&
+		(len(t.WantedFiles) == 0 || btNormPath(t.WantedFiles[0]) == meta.Name)
 	// 种子内置 tracker 并入任务列表(详情展示与重启用)
 	has := map[string]bool{}
 	for _, u := range t.Trackers {
@@ -509,6 +515,7 @@ func (m *Manager) runBT(ctx context.Context, t *Task) error {
 		t.mu.Lock()
 		if t.btcl == cl {
 			t.btcl = nil
+			t.stream = nil // 会话结束,边下边播状态一并作废(读取方将报会话未运行)
 		}
 		t.mu.Unlock()
 	}()
@@ -1103,6 +1110,9 @@ func (m *Manager) btPump(ctx context.Context, t *Task, cl *bt.Client, meta *bt.M
 		if i%30 == 0 { // 每 15 秒持久化位图与上传量
 			m.btSaveBitfieldIfOwned(t, cl, meta)
 		}
+		if i%60 == 30 { // 周期检查边下边播空闲回收(无请求超时还原优先级)
+			m.btStreamIdleReclaim(t, cl)
+		}
 	}
 }
 
@@ -1177,6 +1187,7 @@ func (m *Manager) goSeeding(t *Task, cl *bt.Client) {
 				t.mu.Lock()
 				if t.btcl == cl {
 					t.btcl = nil
+					t.stream = nil
 				}
 				t.mu.Unlock()
 				return
@@ -1186,6 +1197,7 @@ func (m *Manager) goSeeding(t *Task, cl *bt.Client) {
 			if t.btcl == cl {
 				t.Connections = 0 // 会话结束,连接数清零
 				t.btcl = nil
+				t.stream = nil
 			}
 			t.mu.Unlock()
 		}()
