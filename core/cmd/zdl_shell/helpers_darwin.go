@@ -2,7 +2,7 @@
 
 // 常驻组件的启动辅助(zdl_ui 两形态共用的启动辅助与锁文件互斥判定中,
 // 本文件只含日志与诊断——互斥/派生在 mutex_darwin.go;与 helpers_windows.go
-// 同构;v3 转正后与引擎侧收敛为共享 internal/boot 包)。
+// 同构;待与引擎侧收敛为共享 internal/boot 包)。
 package main
 
 import (

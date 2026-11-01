@@ -6,7 +6,7 @@
 
 [English](README.md) | 简体中文
 
-免费开源的多协议下载工具。一个程序文件,双击就能用——HTTP 多线程下载、BT/磁力、
+免费开源的多协议下载工具。解压即用,无需安装——HTTP 多线程下载、BT/磁力、
 m3u8 视频、RSS 订阅都装在里面,自带桌面管理界面,还可以用浏览器扩展接管浏览器里的下载。
 
 ## 功能
@@ -46,11 +46,15 @@ m3u8 视频、RSS 订阅都装在里面,自带桌面管理界面,还可以用浏
 
 从 [Releases](../../releases) 下载对应平台的压缩包,解压后直接运行:
 
-- **Windows**:双击 `zdownloader.exe`
+- **Windows**:双击 `zdl_ui.exe`
 - **macOS**:打开 `ZDownloader.app`
-- **Linux**:运行 `zdownloader`,浏览器访问界面
+- **Linux**:运行 `zdl`,浏览器访问界面
 
-不想用桌面窗口时,可以加 `-headless` 参数以纯服务方式运行(适合 NAS / 服务器)。
+启动 `zdl_ui` 会带起整套:窗口模块唤起常驻托盘 `zdl_shell`,托盘再启动无头引擎
+`zdl`——关窗不停止下载,托盘「退出」才整体结束。
+
+NAS / 服务器场景只跑引擎即可:运行 `zdl`,浏览器打开 `http://127.0.0.1:8620`
+就是完整管理界面,全程无窗口。
 
 ### 安装浏览器扩展(可选)
 
@@ -59,13 +63,14 @@ Chrome 打开 `chrome://extensions` → 开启「开发者模式」→「加载�
 
 ### 命令行参数
 
+引擎 `zdl` 的参数(`zdl_shell` / `zdl_ui` 同样接受 `-data` 与 `-pprof`):
+
 | 参数 | 说明 |
 |---|---|
 | `-port N` | 指定端口(默认 8620,被占用自动顺延) |
 | `-dir PATH` | 指定下载目录 |
 | `-data PATH` | 指定数据目录 |
-| `-no-tray` | 不显示托盘图标 |
-| `-headless` | 无界面模式,仅提供 HTTP 服务 |
+| `-pprof N` | 在 127.0.0.1:N 暴露 pprof 诊断端点(默认关闭) |
 
 ## 从源码构建
 
@@ -78,6 +83,9 @@ Chrome 打开 `chrome://extensions` → 开启「开发者模式」→「加载�
 # Windows
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
+
+两个脚本都支持 `-NoUI`(只出无头引擎)与 `-UIVariant fyne|wails`(选择桌面窗口
+栈,Windows 默认 Fyne、macOS 默认 Wails,两者产物同为 `zdl_ui`)。
 
 构建产物在 `dist/` 目录,含可执行程序、浏览器扩展和 `.app` 包。
 

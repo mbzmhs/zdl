@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ZDownloader macOS 构建脚本(对应 Windows 侧 scripts/build.ps1)。
-# v3 三件套:zdl(无头引擎,纯 Go 零 cgo)+ zdl_shell(常驻托盘/悬浮窗)+
+# 三件套:zdl(无头引擎,纯 Go 零 cgo)+ zdl_shell(常驻托盘/悬浮窗)+
 # zdl_ui(窗口模块,技术栈二选一:默认 wails(WKWebView,macOS 系统 webview,
 # 内存占用低于 Fyne 的 GL/GLFW 栈);-UIVariant fyne 出 Fyne 变体,两者产物
 # 同名 zdl_ui,常驻组件按固定名唤窗、不感知技术栈)。
@@ -87,14 +87,14 @@ if [ -f "$root/icon.png" ]; then
         || echo "genicons failed, 沿用仓库内已提交图标" >&2
 fi
 
-echo "== build v3 三件套 =="
+echo "== build 三件套 =="
 # Windows 的 -H windowsgui 在 Mac 无对应物,不需要
 mkdir -p "$out"
 go build -trimpath -ldflags "-s -w" -o "$out/zdl" ./cmd/zdl
 
 if [ "$want_ui" = 1 ]; then
     go build -trimpath -ldflags "-s -w" -o "$out/zdl_shell" ./cmd/zdl_shell
-    # zdl_ui 窗口技术栈二选一(Fyne 默认 / Wails·WKWebView;WebView2 是 Windows
+    # zdl_ui 窗口技术栈二选一(Wails·WKWebView 默认 / Fyne;WebView2 是 Windows
     # 运行时,mac 的 Wails 变体走 WKWebView)。两者产物同名 zdl_ui——常驻组件
     # 按固定名唤窗、不感知技术栈,谁最后编进 dist 谁生效。Wails 分支固化
     # -tags "wails,production"(防"非生产桩"漏 tag 弹窗)。
@@ -106,7 +106,7 @@ if [ "$want_ui" = 1 ]; then
 fi
 
 echo "== assemble dist =="
-# 清理 1.8 布局遗留(旧脚本产物 zdownloader 单体二进制),避免与 v3 三件套混装
+# 清理 1.8 布局遗留(旧脚本产物 zdownloader 单体二进制),避免与三件套混装
 rm -f "$out/zdownloader" "$out/zdownloader~"
 rm -rf "$out/extension"
 cp -R "$root/extension" "$out/extension"
@@ -124,7 +124,7 @@ if [ "$want_ui" = 1 ]; then
 fi
 
 # .app bundle:Finder 双击/通知归属/magnet 与 .torrent 关联都依赖它。
-# CFBundleExecutable=zdl_ui(v3 三件套的入口 exe:双击/关联/托盘召唤都汇聚
+# CFBundleExecutable=zdl_ui(三件套的入口 exe:双击/关联/托盘召唤都汇聚
 # 于此),三二进制 + web/ 同入 bundle 互拉(sibling 按同目录固定名)。
 # 裸二进制保留在 bundle 同级供开发直跑(数据目录跟随 exe 所在目录;
 # bundle 内运行则自动落用户配置目录,见各 cmd main.go 的 defaultDataDir)。

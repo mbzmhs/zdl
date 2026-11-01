@@ -1,7 +1,7 @@
 //go:build windows
 
-// zdlui 两形态共用的启动辅助与 Win32 互斥量判定(与 cmd/zdl 各持副本;
-// v3 转正后与引擎侧收敛为共享 internal/boot 包)。
+// zdl_ui 两形态共用的启动辅助与 Win32 互斥量判定(与 cmd/zdl 各持副本;
+// 待与引擎侧收敛为共享 internal/boot 包)。
 
 package main
 

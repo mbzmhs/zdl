@@ -1,7 +1,7 @@
 // ZDownloader 无头引擎(zdl):纯数据面——下载/BT/HLS/RSS 引擎 + 回环 REST/SSE
-// API + 任务持久化。设计约束(三件套架构,见 cmd/zdlui):
+// API + 任务持久化。设计约束(三件套架构,见 cmd/zdl_shell、cmd/zdl_ui):
 //   - 零系统特殊性:无托盘、无窗口、无文件关联、无原生对话框、不 spawn 任何
-//     进程;OS 相关职责全部归 zdlui(托盘/悬浮窗常驻组件 + Fyne 窗口)。
+//     进程;OS 相关职责全部归原生壳(托盘/悬浮窗常驻组件 + 窗口模块)。
 //   - 纯 Go 可构建:不依赖 cgo/Fyne,交叉编译无需 MinGW。
 //   - 生命周期由常驻组件驱动:引擎常驻直到 /api/shutdown(托盘「退出」)或
 //     SIGTERM;UI 进程生死与引擎无关(关窗驻留/退进程均不影响下载)。
@@ -159,7 +159,7 @@ func engineAlreadyRunning(port int) bool {
 	return resp.StatusCode == http.StatusOK && strings.Contains(string(body), "ZDownloader")
 }
 
-/* ---------------- 启动辅助(与 zdlui 各持副本;v3 转正后收敛 internal/boot) ---------------- */
+/* ---------------- 启动辅助(与 zdl_shell/zdl_ui 各持副本;待收敛 internal/boot) ---------------- */
 
 func defaultDownloadDir() string {
 	home, err := os.UserHomeDir()

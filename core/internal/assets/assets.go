@@ -1,4 +1,4 @@
-// Package assets 承载原生壳(cmd/zdl3)所需的静态资源 embed。
+// Package assets 承载原生壳(zdl_shell / zdl_ui)所需的静态资源 embed。
 // go:embed 不能引用上级目录,故从 core/assets 与 webapp/src/assets 复制
 // 副本;两处源头更新时需同步(打包里程碑把复制收进构建脚本)。
 package assets

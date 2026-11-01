@@ -7,7 +7,7 @@
 // 注意 Mac 侧 floatX/floatY 语义为 Cocoa 全局坐标的「左上角」(y 自各屏
 // 底部起算),与 Windows 的 y 向下坐标不同机不混存,无互迁移需求。
 // 位置回存:windowDidMove → 导出桥 → PUT /api/config(与 Windows savePos 同 JSON)。
-// (v3 自 internal/desktop 迁入:1.8 全家桶退役后此处是 mac 悬浮窗唯一实现,
+// (自 internal/desktop 迁入:1.8 全家桶退役后此处是 mac 悬浮窗唯一实现,
 // 供 zdl_shell 经 floatwin 包复用;app 级 zdApp* 辅助随 1.8 App 生命周期淘汰。)
 package floatwin
 

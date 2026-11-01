@@ -1,4 +1,4 @@
-// Package vlc 提供 libvlc 的纯 Go 绑定(v3 原生 UI 播放内核)。
+// Package vlc 提供 libvlc 的纯 Go 绑定(原生 UI 播放内核)。
 //
 // 平台拆分:Windows 用 syscall.LoadLibraryEx 纯标准库实现(本文件,零 cgo/
 // 零第三方);Unix 用 purego dlopen(vlc_unix.go)。API 面刻意收窄为轮询式

@@ -19,6 +19,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $core = Join-Path $root "core"
 $dist = Join-Path $root "dist"
 $version = "2.0.0"
+# 产物目录(与 mac 侧 build.sh 同名规则):旧单体与三件套共用一个版本化目录
+$outDir = Join-Path $dist ("ZDownloader-v{0}-windows-amd64" -f $version)
 
 # 组件模型:引擎 zdl 恒编;zdl_shell 与 zdl_ui 是不可拆分的 UI 对(shell 唤 ui 常驻、
 # ui 依赖 shell 持久化),整对同编/同不编。-NoUI 时整对不编(只出引擎)。前端产物
@@ -122,11 +124,11 @@ if ($wantUI -and (Test-Path $rootIcon)) {
 }
 # 应用图标:.syso(资源 ID 3,供窗口/任务栏与 Explorer 使用)在 app.ico 变更后重新生成;
 # genico 是独立模块(构建期工具,依赖不进核心 go.mod),刷新失败时沿用仓库内已提交的 .syso
-# Go 只自动链接"被编译包目录"下的 .syso:core 根那份供旧 Wails 构建,原生壳 v3 的窗口
+# Go 只自动链接"被编译包目录"下的 .syso:core 根那份供旧 Wails 构建,原生壳的窗口
 # 是 cmd\zdl_ui 包,故每次生成/有更新后须同步一份到该目录,否则 zdl_ui.exe 无图标资源
 # (Windows 默认图);zdl/zdl_shell 无图标,无需同步。
 $coreSyso = Join-Path $core "rsrc_windows_amd64.syso"
-$v3Syso   = Join-Path $core "cmd\zdl_ui\rsrc_windows_amd64.syso"
+$uiSyso   = Join-Path $core "cmd\zdl_ui\rsrc_windows_amd64.syso"
 $coreIco = Join-Path $core "assets\app.ico"
 if ($wantUI -and (Test-Path $coreIco) -and ((-not (Test-Path $coreSyso)) -or ((Get-Item $coreIco).LastWriteTime -gt (Get-Item $coreSyso).LastWriteTime))) {
     Write-Host "== Regenerate icon syso =="
@@ -135,33 +137,32 @@ if ($wantUI -and (Test-Path $coreIco) -and ((-not (Test-Path $coreSyso)) -or ((G
     if ($LASTEXITCODE -ne 0) { Write-Host "genico failed, using committed syso" }
     Pop-Location
 }
-if ($wantUI -and (Test-Path $coreSyso) -and ((-not (Test-Path $v3Syso)) -or ((Get-Item $coreSyso).LastWriteTime -gt (Get-Item $v3Syso).LastWriteTime))) {
+if ($wantUI -and (Test-Path $coreSyso) -and ((-not (Test-Path $uiSyso)) -or ((Get-Item $coreSyso).LastWriteTime -gt (Get-Item $uiSyso).LastWriteTime))) {
     # 同步失败只降级(沿用 cmd\zdl_ui 已提交的 syso),不能终止整个构建——
     # 图标子步是锦上添花,绝不能因它漏编三个 exe(曾因此整段构建中止)。
-    try { Copy-Item $coreSyso $v3Syso -Force } catch { Write-Host "syso 同步到 cmd\zdl_ui 失败,沿用已提交 syso: $_" }
+    try { Copy-Item $coreSyso $uiSyso -Force } catch { Write-Host "syso 同步到 cmd\zdl_ui 失败,沿用已提交 syso: $_" }
 }
 # -H windowsgui: Windows 下无命令行窗口,常驻托盘,日志写 data\zdownloader.log
-# v3 起根包(旧 1.8 Wails 单体 zdownloader)已移除,入口迁到 cmd/{zdl,zdl_shell,zdl_ui};
-# 干净 v3 检出的 core/ 根目录没有任何 Go 文件,若仍对根包执行 go build .,会在
+# 旧 1.8 Wails 单体(zdownloader,根包)已移除,入口迁到 cmd/{zdl,zdl_shell,zdl_ui};
+# 干净检出的 core/ 根目录没有任何 Go 文件,若仍对根包执行 go build .,会在
 # ErrorActionPreference=Stop 下以 "no Go files" 中止整个构建(曾因此三件套漏编、
-# dist/zdl3 产物停留旧版)。故先探测根包是否可编译,不可则整段跳过旧单体的
-# 构建/交叉编译/打包,只产出 v3 三件套。
+# 产物停留旧版)。故先探测根包是否可编译,不可则整段跳过旧单体的
+# 构建/交叉编译/打包,只产出三件套。
 $hasLegacyApp = (& $go list -e -f "{{if .GoFiles}}yes{{end}}" . 2>$null) -eq "yes"
 if ($hasLegacyApp) {
-    $outDir = Join-Path $dist "ZDownloader-v$version-windows-amd64"
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     & $go build -trimpath -tags "desktop,production" -ldflags "-s -w -H windowsgui" -o (Join-Path $outDir "zdownloader.exe") .
     # Wails 桌面版必须带 desktop,production 构建标签(裸 go build 时 wails CLI 不会代加)
     if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Build failed" }
 }
 
-# v3 三件套(cmd/zdl + cmd/zdl_shell + cmd/zdl_ui):zdl=无头引擎(纯 Go,
+# 三件套(cmd/zdl + cmd/zdl_shell + cmd/zdl_ui):zdl=无头引擎(纯 Go,
 # 零 cgo,无图标);zdl_shell=常驻组件(托盘/悬浮窗,纯 Win32,无图标);
 # zdl_ui=可替换 UI 模块(窗口技术栈 Fyne/Wails 二选一,见下方 -UIVariant,
 # 两者产物同名 zdl_ui.exe)。字体/图标子集已提交到 internal/assets,无需额外生成步骤。
 # 内置管理界面:引擎经 os.DirFS(同目录 web/)对浏览器开放,与桌面端共用
 # 同一套 API(旧 Wails 壳退役后 web 不再 go:embed,改为文件夹分发,可独立更新)
-$webDist = Join-Path $dist "zdl3\web"
+$webDist = Join-Path $outDir "web"
 # web/ 仅 UI/浏览器管理界面消费;无头产物(不编 zdl_ui)跳过整段拷贝
 if ($wantWeb -and (Test-Path (Join-Path $core "web\index.html"))) {
     Write-Host "== Copy web UI -> dist =="
@@ -171,12 +172,13 @@ if ($wantWeb -and (Test-Path (Join-Path $core "web\index.html"))) {
 
 if ($wantZdl) {
     Write-Host "== Build zdl (headless engine) =="
-    & $go build -trimpath -ldflags "-s -w -H windowsgui" -o (Join-Path $dist "zdl3\zdl.exe") ./cmd/zdl
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    & $go build -trimpath -ldflags "-s -w -H windowsgui" -o (Join-Path $outDir "zdl.exe") ./cmd/zdl
     if ($LASTEXITCODE -ne 0) { Pop-Location; throw "zdl build failed" }
 }
 if ($wantShell) {
     Write-Host "== Build zdl_shell (resident tray) =="
-    & $go build -trimpath -ldflags "-s -w -H windowsgui" -o (Join-Path $dist "zdl3\zdl_shell.exe") ./cmd/zdl_shell
+    & $go build -trimpath -ldflags "-s -w -H windowsgui" -o (Join-Path $outDir "zdl_shell.exe") ./cmd/zdl_shell
     if ($LASTEXITCODE -ne 0) { Pop-Location; throw "zdl_shell build failed" }
 }
 # 桌面窗口模块 zdl_ui.exe:技术栈二选一(Fyne 默认 / Wails·WebView2),两者产物同名
@@ -187,15 +189,15 @@ if ($wantShell) {
 if ($wantUI) {
     if ($UIVariant -eq "wails") {
         Write-Host "== Build zdl_ui (Wails/WebView2 窗口; -tags wails,production) =="
-        & $go build -trimpath -tags "wails,production" -ldflags "-s -w -H windowsgui" -o (Join-Path $dist "zdl3\zdl_ui.exe") ./cmd/zdl_ui
+        & $go build -trimpath -tags "wails,production" -ldflags "-s -w -H windowsgui" -o (Join-Path $outDir "zdl_ui.exe") ./cmd/zdl_ui
     } else {
         Write-Host "== Build zdl_ui (Fyne 窗口, 默认) =="
-        & $go build -trimpath -ldflags "-s -w -H windowsgui" -o (Join-Path $dist "zdl3\zdl_ui.exe") ./cmd/zdl_ui
+        & $go build -trimpath -ldflags "-s -w -H windowsgui" -o (Join-Path $outDir "zdl_ui.exe") ./cmd/zdl_ui
     }
     if ($LASTEXITCODE -ne 0) { Pop-Location; throw "zdl_ui build failed" }
 }
 
-# v3 无根包单体可交叉编译;-CrossCompile 仅对旧 Wails 单体生效
+# 无根包单体可交叉编译;-CrossCompile 仅对旧 Wails 单体生效
 if ($CrossCompile -and $hasLegacyApp) {
     $env:GOOS = "linux";   $env:GOARCH = "amd64"
     & $go build -trimpath -ldflags "-s -w" -o (Join-Path $outDir "zdownloader-linux-amd64") .
@@ -237,12 +239,43 @@ Remove-Item -Recurse -Force $stage
     Write-Host "Done: $outDir"
     Write-Host "      $zip"
 } else {
-    # v3:只产出所选组件到 dist/zdl3/,无旧 Wails 单体可打包;
-    # 按实际编出的组件动态回显,无头(-NoUI/仅 zdl)时不再是"三件套"
+    # 三件套打包:与 mac 侧 build.sh 同构——装配 extension/README/LICENSE 后
+    # 从暂存目录打 zip,排除用户数据 data/(日志可能被运行中的实例锁定,
+    # 且不属于发布物);按实际编出的组件动态回显,无头(-NoUI)时不再是"三件套"
+    Write-Host "== Assemble dist =="
+    $extDst = Join-Path $outDir "extension"
+    if (Test-Path $extDst) { Remove-Item -Recurse -Force $extDst }
+    # Windows 删除是异步完成的(delete-pending):立即重建同名目录会静默失败,需等待名字释放
+    foreach ($i in 1..30) {
+        if (-not (Test-Path $extDst)) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    Copy-Item -Recurse -Force (Join-Path $root "extension") $extDst
+    if (-not (Test-Path (Join-Path $extDst "manifest.json"))) { throw "extension copy failed (delete-pending race?)" }
+    Copy-Item -Force (Join-Path $root "README.md") $outDir
+    Copy-Item -Force (Join-Path $root "README.zh-CN.md") $outDir
+    Copy-Item -Force (Join-Path $root "LICENSE") $outDir
+    # go build 替换正在运行的 exe 时会留下备份文件,不属于发布物
+    foreach ($exe in @("zdl.exe", "zdl_shell.exe", "zdl_ui.exe")) {
+        Remove-Item (Join-Path $outDir ($exe + "~")) -ErrorAction SilentlyContinue
+    }
+
+    $zip = "$outDir.zip"
+    if (Test-Path $zip) { Remove-Item $zip }
+    $stage = Join-Path $env:TEMP ("ZDownloader-v" + $version + "-windows-amd64")
+    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    New-Item -ItemType Directory -Path $stage | Out-Null
+    Get-ChildItem $outDir | Where-Object { $_.Name -ne "data" } | ForEach-Object {
+        Copy-Item -Recurse -Force $_.FullName (Join-Path $stage $_.Name)
+    }
+    Compress-Archive -Path $stage -DestinationPath $zip
+    Remove-Item -Recurse -Force $stage
+
     $built = @()
     if ($wantZdl)   { $built += "zdl.exe" }
     if ($wantShell) { $built += "zdl_shell.exe" }
     if ($wantUI)    { $built += "zdl_ui.exe"; $built += "web/" }
-    Write-Host ("== v3 构建完成(组件: {0}) ==" -f ($built -join " / "))
-    Write-Host "Done: $(Join-Path $dist 'zdl3')"
+    Write-Host ("== 构建完成(组件: {0}) ==" -f ($built -join " / "))
+    Write-Host "Done: $outDir"
+    Write-Host "      $zip"
 }

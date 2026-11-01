@@ -6,7 +6,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A free and open-source multi-protocol downloader. One single program file, ready to use out of the box — HTTP multi-thread downloads, BT/magnet, m3u8 video streams and RSS subscriptions are all built in, with a native desktop UI and a browser extension that takes over your downloads.
+A free and open-source multi-protocol downloader. Unpack and run, nothing to install — HTTP multi-thread downloads, BT/magnet, m3u8 video streams and RSS subscriptions are all built in, with a native desktop UI and a browser extension that takes over your downloads.
 
 ## Features
 
@@ -45,11 +45,13 @@ A free and open-source multi-protocol downloader. One single program file, ready
 
 Download the archive for your platform from the [Releases](../../releases) page, extract it, and run:
 
-- **Windows**: double-click `zdownloader.exe`
+- **Windows**: double-click `zdl_ui.exe`
 - **macOS**: open `ZDownloader.app`
-- **Linux**: run `zdownloader`, then open the UI in your browser
+- **Linux**: run `zdl`, then open the UI in your browser
 
-Add the `-headless` flag to run without any window (HTTP service only, ideal for NAS / servers).
+Launching `zdl_ui` starts the whole stack: the window module pulls up the resident tray (`zdl_shell`), which starts the headless engine (`zdl`). Closing the window keeps downloads running; quit from the tray to stop everything.
+
+For NAS / servers, run the engine alone — `zdl` serves the same management UI in the browser at `http://127.0.0.1:8620`, no window needed.
 
 ### Browser extension (optional)
 
@@ -57,13 +59,14 @@ Open `chrome://extensions` in Chrome → enable "Developer mode" → "Load unpac
 
 ### Command line options
 
+Options of the engine `zdl` (`zdl_shell` / `zdl_ui` also accept `-data` and `-pprof`):
+
 | Option | Description |
 |---|---|
 | `-port N` | Listen port (default 8620, auto-increments if busy) |
 | `-dir PATH` | Download directory |
 | `-data PATH` | Data directory |
-| `-no-tray` | Do not show the tray icon |
-| `-headless` | Run without a window, HTTP service only |
+| `-pprof N` | pprof diagnostics on 127.0.0.1:N (off by default) |
 
 ## Build from Source
 
@@ -77,7 +80,9 @@ Requires Go 1.25+ and Node.js 18+ (macOS additionally needs Xcode Command Line T
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
-Build artifacts go to `dist/`, including the executable, the browser extension and the macOS `.app` bundle.
+Both scripts accept `-NoUI` (engine-only headless build) and `-UIVariant fyne|wails` to choose the desktop window stack (Windows defaults to Fyne, macOS to Wails; both variants ship as the same `zdl_ui` binary).
+
+Build artifacts go to `dist/`, including the executables, the browser extension and the macOS `.app` bundle.
 
 ## Privacy
 

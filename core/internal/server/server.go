@@ -1273,7 +1273,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "接口不存在")
 		return
 	}
-	// 原生壳(v3)不嵌入 Web UI:web 为 nil 时静态区整体 404,仅 API 可用
+	// 原生壳不嵌入 Web UI:web 为 nil 时静态区整体 404,仅 API 可用
 	if s.web == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return

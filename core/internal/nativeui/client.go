@@ -1,4 +1,4 @@
-// Package nativeui 是 v3 原生桌面外壳(Fyne):与 Wails 壳、浏览器扩展同构的
+// Package nativeui 是原生桌面外壳(Fyne):与 Wails 壳、浏览器扩展同构的
 // API 客户端——引擎与回环 HTTP 服务完全复用,外壳只做展示与交互。
 //
 // 数据契约(对齐 Vue 版 store.js,移植基准见 docs/native-ui-porting.md):
