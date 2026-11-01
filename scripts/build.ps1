@@ -18,7 +18,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $core = Join-Path $root "core"
 $dist = Join-Path $root "dist"
-$version = "1.8.0"
+$version = "2.0.0"
 
 # 组件模型:引擎 zdl 恒编;zdl_shell 与 zdl_ui 是不可拆分的 UI 对(shell 唤 ui 常驻、
 # ui 依赖 shell 持久化),整对同编/同不编。-NoUI 时整对不编(只出引擎)。前端产物
