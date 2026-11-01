@@ -4,7 +4,7 @@
 // DOM 对齐旧 #settingsOverlay。
 import { ref, reactive, computed, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
 import { api } from "../lib/api.js";
-import { store, ui, openOverlay, closeOverlay, toast, showErr, confirmBox, pickDir } from "../store.js";
+import { store, ui, openOverlay, closeOverlay, toast, showErr, confirmBox, pickDir, wailsApp } from "../store.js";
 import Overlay from "./Overlay.vue";
 import ZSelect from "./ZSelect.vue";
 import ZTimePicker from "./ZTimePicker.vue";
@@ -33,6 +33,7 @@ const f = reactive({
   downloadDir: "", maxActive: 1, maxConn: 8,
   globalLimit: 0, globalLimitUnit: "KB", userAgent: "",
   skipTLS: false, openBrowser: false, autoStart: false, showFloat: true,
+  uiExitOnClose: false,
   proxyMode: "none", proxyUrl: "", followView: "",
   proxyHTTP: true, proxyTracker: true, proxyPeer: true, proxyWebSeed: true, dohDNS: true,
   autoOpenTorrent: false,
@@ -52,6 +53,7 @@ const bansCount = ref(0);
 // 文件关联:平台(决定交互形态)与 macOS 接管实况(LaunchServices 真实查询)
 const assocPlatform = ref("");
 const assocMagnetOk = ref(false), assocTorrentOk = ref(false);
+const desktopOnlyHint = ref(false); // 浏览器模式:自启/关联为桌面机设置,跳过
 const clientBLDraft = ref([]);
 const sysLog = ref("加载中…");
 let sysLogSig = "";
@@ -151,11 +153,22 @@ async function openSettingsDialog() {
   if (f.proxyMode === "env") refreshFollowProxy();
   // 文件关联开关以注册表实况为准;"自动打开种子"跟随配置
   f.autoOpenTorrent = !!cfg.autoOpenTorrent;
-  api("GET", "/api/assoc").then(a => {
-    assocPlatform.value = a.platform || "";
-    assocMagnetOk.value = !!a.magnet; assocTorrentOk.value = !!a.torrent;
-    f.assocMagnet = !!a.magnet; f.assocTorrent = !!a.torrent;
-  }).catch(() => {});
+  // 关联/自启是"桌面所在机器"的设置:Wails 壳经 JS 桥直调注册表/LS;浏览器
+  // 模式没有本机语义,接口已裁撤,加载失败按未知平台处理(保存时跳过)
+  const app = wailsApp();
+  if (app && app.AssocStatus) {
+    app.AssocStatus().then(a => {
+      assocPlatform.value = a.platform || "";
+      assocMagnetOk.value = !!a.magnet; assocTorrentOk.value = !!a.torrent;
+      f.assocMagnet = !!a.magnet; f.assocTorrent = !!a.torrent;
+    }).catch(() => {});
+  } else {
+    api("GET", "/api/assoc").then(a => {
+      assocPlatform.value = a.platform || "";
+      assocMagnetOk.value = !!a.magnet; assocTorrentOk.value = !!a.torrent;
+      f.assocMagnet = !!a.magnet; f.assocTorrent = !!a.torrent;
+    }).catch(() => {});
+  }
   // 粒度开关:未配置(旧版本)视为开启
   f.proxyHTTP = cfg.proxy?.forHTTP !== false;
   f.proxyTracker = cfg.proxy?.forTracker !== false;
@@ -164,6 +177,7 @@ async function openSettingsDialog() {
   f.dohDNS = cfg.proxy?.dohDNS !== false;
   f.skipTLS = !!cfg.skipTLSVerify;
   f.openBrowser = !!cfg.openBrowser;
+  f.uiExitOnClose = !!cfg.uiExitOnClose;
   f.showFloat = cfg.showFloatWindow !== false;
   // BT 设置
   const bt = cfg.bt || {};
@@ -199,7 +213,11 @@ async function openSettingsDialog() {
   f.rssWindowEnd = rss.windowEnd || "23:59";
   f.rssAutoDl = ["off", "notify", "silent"].includes(rss.autoDl) ? rss.autoDl : "off";
   // 开机自启独立于 config.json,状态以注册表为准;读取失败不阻塞弹窗
-  api("GET", "/api/autostart").then(a => { f.autoStart = !!a.enabled; }).catch(() => {});
+  if (app && app.AutostartEnabled) {
+    app.AutostartEnabled().then(v => { f.autoStart = !!v; }).catch(() => {});
+  } else {
+    api("GET", "/api/autostart").then(a => { f.autoStart = !!a.enabled; }).catch(() => {});
+  }
   // DHT 路由表健康度:节点数实时展示(未入网通常需 1-2 分钟)
   api("GET", "/api/stats").then(st => {
     const n = +st.dhtNodes || 0;
@@ -242,6 +260,7 @@ async function save() {
     },
     skipTLSVerify: f.skipTLS,
     openBrowser: f.openBrowser,
+    uiExitOnClose: f.uiExitOnClose,
     showFloatWindow: f.showFloat,
     autoOpenTorrent: f.autoOpenTorrent,
     bt: {
@@ -277,30 +296,44 @@ async function save() {
   try {
     store.cfg = await api("PUT", "/api/config", body);
   } catch (e) { showErr(e); return; }
-  // 开机自启保存失败不影响其余设置(已成功落盘)
-  try { await api("POST", "/api/autostart", { enabled: f.autoStart }); }
-  catch (e) { showErr(e); }
-  // 文件关联:按开关写注册表;失败不阻断其余设置,响应为注册表实况。
-  // macOS 走「接管系统关联」按钮的即时流,不走保存(避免旧开关值重复弹系统框)。
-  if (assocPlatform.value !== "darwin") {
+  // 自启/关联:桌面机操作,Wails 壳走桥直调;浏览器模式没有"本机"语义,
+  // 跳过(单条温和提示,替代已裁撤接口的俩报错)
+  const app = wailsApp();
+  if (app && app.SetAutostart) {
     try {
-      const a = await api("POST", "/api/assoc", { magnet: f.assocMagnet, torrent: f.assocTorrent });
-      f.assocMagnet = !!a.magnet;
-      f.assocTorrent = !!a.torrent;
+      await app.SetAutostart(f.autoStart);
+      if (assocPlatform.value !== "darwin") {
+        await app.SetAssoc(f.assocMagnet, f.assocTorrent);
+        f.assocMagnet = assocMagnetOk.value = !!f.assocMagnet;
+        f.assocTorrent = assocTorrentOk.value = !!f.assocTorrent;
+      }
     } catch (e) { showErr(e); }
+  } else {
+    desktopOnlyHint.value = true;
   }
   closeOverlay("settingsOverlay");
-  toast("设置已保存", "ok");
+  if (desktopOnlyHint.value) {
+    desktopOnlyHint.value = false;
+    toast("设置已保存(开机自启/文件关联为桌面端设置,浏览器模式未改动)", "");
+  } else {
+    toast("设置已保存", "ok");
+  }
 }
 
 // macOS:请求 LaunchServices 接管默认应用——系统弹确认框,用户点「使用
 // ZDownloader」即生效;延迟回读真实状态,未生效则提示去点弹窗。
 async function takeOverAssoc() {
+  const app = wailsApp();
   try {
-    await api("POST", "/api/assoc", { magnet: true, torrent: true });
+    if (app && app.SetAssoc) {
+      await app.SetAssoc(true, true);
+    } else {
+      await api("POST", "/api/assoc", { magnet: true, torrent: true });
+    }
     setTimeout(async () => {
       try {
-        const s = await api("GET", "/api/assoc");
+        const s = (app && app.AssocStatus) ? await app.AssocStatus()
+          : await api("GET", "/api/assoc");
         assocMagnetOk.value = !!s.magnet; assocTorrentOk.value = !!s.torrent;
         if (s.magnet && s.torrent) toast("已接管系统关联", "ok");
         else toast("请在系统弹窗中点「使用 ZDownloader」确认", "");
@@ -410,6 +443,10 @@ export default { name: "SettingsDialog" };
             <div class="switch-row">
               <label class="switch"><input type="checkbox" v-model="f.showFloat"><span class="track"></span></label>
               <span class="lbl">悬浮下载进度窗<span class="q"><i>?</i><span class="q-tip">桌面版:置顶小窗常显总速度与任务进度。</span></span></span>
+            </div>
+            <div class="switch-row">
+              <label class="switch"><input type="checkbox" v-model="f.uiExitOnClose"><span class="track"></span></label>
+              <span class="lbl">关闭窗口时退出 UI 进程(释放内存)<span class="q"><i>?</i><span class="q-tip">桌面版:默认关闭=关窗隐藏驻留(托盘唤起秒开);打开=关窗即退出 UI 进程,引擎与托盘不受影响,下次托盘唤起重新拉起。</span></span></span>
             </div>
           </div>
 

@@ -39,8 +39,8 @@ func TestEnableDisableRoundtrip(t *testing.T) {
 	if !strings.Contains(content, "<string>"+exe+"</string>") {
 		t.Fatalf("plist 应含当前程序路径: %s", content)
 	}
-	if !strings.Contains(content, "<string>--no-browser</string>") {
-		t.Fatalf("plist 应附 --no-browser: %s", content)
+	if strings.Contains(content, "<string>--tray</string>") {
+		t.Fatalf("plist 不应再附 --tray(程序恒为常驻托盘): %s", content)
 	}
 
 	// RefreshSelf 自愈:内容被破坏后应被改写回最新路径
@@ -70,7 +70,7 @@ func TestEnableDisableRoundtrip(t *testing.T) {
 
 // plistContent 应转义 XML 特殊字符(路径可能含 &)。
 func TestPlistContentEscape(t *testing.T) {
-	out := plistContent([]string{"/a&b/c", "--no-browser"})
+	out := plistContent([]string{"/a&b/c", "<arg>"})
 	if strings.Contains(out, "/a&b/c") {
 		t.Fatalf("& 应被转义: %s", out)
 	}

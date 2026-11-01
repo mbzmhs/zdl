@@ -728,6 +728,21 @@ func (m *Manager) UpdateWindowPos(x, y, w, h int) {
 	_ = m.cfg.Save(m.cfgPath)
 }
 
+// UpdateTheme 记住 UI 明暗主题(dark/light,UI 切换按钮调用),落盘,不动其他配置。
+// 原生壳曾只把主题存在 UI Store 内存里(store.go 注释"持久化在打磨阶段接 conf.Theme"),
+// 重启即丢——与 UpdateWindowPos 同模式补上 conf.Theme 的写回通道。
+func (m *Manager) UpdateTheme(t string) {
+	m.cfg.Theme = t
+	_ = m.cfg.Save(m.cfgPath)
+}
+
+// UpdateLastView 记住 UI 侧栏当前视图(分离模式下 UI 进程切换视图时经 API 调用),
+// 落盘,不动其他配置;新 UI 进程启动时恢复到用户上次所在页。
+func (m *Manager) UpdateLastView(v string) {
+	m.cfg.LastView = v
+	_ = m.cfg.Save(m.cfgPath)
+}
+
 func (m *Manager) UpdateConfig(cfg conf.Config) error {
 	old := m.cfg
 	cfg.Save(m.cfgPath)
@@ -1374,6 +1389,18 @@ func (m *Manager) Shutdown(ctx context.Context) {
 		t.mu.Lock()
 		if t.Status == StatusRunning && t.cancel != nil {
 			t.cancel()
+		} else if t.Status == StatusSeeding {
+			// 做种会话的退出信号不是 t.cancel(上面只取消"运行中"任务),而是 seedStop:
+			// 做种协程只 select{ rootCtx / seedStop },而 rootCtx 要等本函数返回后的
+			// OnExit 才取消——若这里不显式停做种,做种协程会一直活着,seedWG 永不
+			// 排空,下面的 select 只能干等满 ctx 上限(退出恒定慢 ~5s 的根因)。
+			// close(seedStop) 让做种协程走正常收尾(cl.Stop/Close/落盘),与"运行中
+			// 任务按等待续传落盘"对齐:做种同样按"下次续种"保留,状态不改。
+			// 置 nil 保证本函数二次调用(handleShutdown 与 main 各一次)幂等。
+			if t.seedStop != nil {
+				close(t.seedStop)
+				t.seedStop = nil
+			}
 		}
 		t.mu.Unlock()
 	}

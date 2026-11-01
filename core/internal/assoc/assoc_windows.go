@@ -181,6 +181,8 @@ func deleteDefaultValue(sub string) error {
 }
 
 // launchCommand 关联启动命令(带引号的程序绝对路径 + "%1")。
+// 指向调用方自身(zdl_ui):它是三件套的应用入口兼编排者——确保引擎/常驻
+// 组件在跑、目标落持久槽、按单实例转交或自任窗口,全程不经引擎进程。
 func launchCommand() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {

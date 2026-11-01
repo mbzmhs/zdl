@@ -63,6 +63,11 @@ type Config struct {
 	WinPosSet bool `json:"winPosSet"`
 	// Theme UI 主题(dark/light),桌面版 toast/悬浮窗配色跟随
 	Theme string `json:"theme"`
+	// LastView UI 进程侧栏当前视图(active/all/...),跨会话恢复上次所在页
+	LastView string `json:"lastView"`
+	// UIExitOnClose 原生壳 UI 进程关窗语义:false=隐藏驻留(托盘唤起秒开、
+	// 状态保留),true=退出 UI 进程释放内存(常驻只剩守护进程)
+	UIExitOnClose bool `json:"uiExitOnClose"`
 	Proxy Proxy  `json:"proxy"`
 	// RecentDirs 最近使用的保存目录(仅创建对话框里用户手动选择/输入且成功建任务
 	// 的路径;自动预填、留空默认、RSS 自动下载不记录)。最新在前,下拉直接展示。

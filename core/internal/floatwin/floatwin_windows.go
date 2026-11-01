@@ -1,17 +1,18 @@
 //go:build windows
 
-// 桌面版原生悬浮进度窗:置顶显示总速度与进行中任务的进度/速度。
-// Wails v2 仅支持单主窗口,悬浮窗用 user32/gdi32 直接实现,运行在独立
-// UI 线程(与托盘同模式)。支持拖动移动、拖边缩放,位置与尺寸写入配置记忆。
+// 悬浮进度窗(常驻组件 zdl_shell 的一部分):置顶显示总速度与进行中任务的
+// 进度/速度,纯 user32/gdi32 自绘,运行在独立 UI 线程(与托盘同模式)。
+// 不依赖任何 UI 框架,也不感知窗口进程——数据自轮询引擎 HTTP 接口
+// (/api/config 的 showFloatWindow 控制显隐、floatX/Y/W/H 记忆位置尺寸,
+// /api/stats 与 /api/tasks 取速度与任务行),支持拖动移动、拖边缩放。
 // 跨线程数据经锁传递,PostMessage 仅作唤醒,避免指针进消息被 GC 回收。
-package desktop
+package floatwin
 
 import (
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"runtime"
 	"sort"
 	"strconv"
@@ -21,8 +22,6 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
-	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // ---------------- Win32 绑定 ----------------
@@ -61,15 +60,8 @@ var (
 	procSetProcessDPIAware = user32.NewProc("SetProcessDPIAware")
 	procSystemPar          = user32.NewProc("SystemParametersInfoW")
 	procIsWindowVisible    = user32.NewProc("IsWindowVisible")
-
-	// 主窗任务栏隐藏:移出屏幕(-32000,WS_VISIBLE 保持、WebView2 不冻结)+ 扩展风格加
-	// WS_EX_TOOLWINDOW、清 WS_EX_APPWINDOW(工具窗不进任务栏)。不最小化,故任务栏恢复等
-	// 边界不会残留工具窗形态;普通最小化按钮始终可用。实测 WDA_HIDE 对本环境无效,弃用。
-	procEnumWindows              = user32.NewProc("EnumWindows")
-	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
-	procGetWindowLongW           = user32.NewProc("GetWindowLongW")
-	procSetWindowLongW           = user32.NewProc("SetWindowLongW")
-	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
+	procDestroyWindow      = user32.NewProc("DestroyWindow")
+	procPostQuitMessage    = user32.NewProc("PostQuitMessage")
 
 	procCreateSolidBrush      = gdi32.NewProc("CreateSolidBrush")
 	procCreateFontW           = gdi32.NewProc("CreateFontW")
@@ -81,7 +73,7 @@ var (
 	procSetStretchBltMode     = gdi32.NewProc("SetStretchBltMode")
 	procGetTextExtentPoint32W = gdi32.NewProc("GetTextExtentPoint32W")
 
-	// 悬浮窗双缓冲:整帧画进内存位图后一次 BitBlt 上屏,消除逐笔直绘的中间帧闪烁
+	// 双缓冲:整帧画进内存位图后一次 BitBlt 上屏,消除逐笔直绘的中间帧闪烁
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
 	procBitBlt                 = gdi32.NewProc("BitBlt")
@@ -99,17 +91,12 @@ const (
 
 	swHide = 0
 
-	// 主窗扩展风格位:工具窗不进任务栏。WS_EX_TOOLWINDOW(0x80)已在上方 wsExTool 定义。
-	wsExAppWindow = 0x40000 // WS_EX_APPWINDOW:让窗体现在于任务栏(撤工具窗时恢复)
+	swpNoSize     = 0x0001
+	swpNoMove     = 0x0002
+	swpNoZOrder   = 0x0004
+	swpNoActivate = 0x0010
+	swpShowWindow = 0x0040
 
-	swpNoSize        = 0x0001
-	swpNoMove        = 0x0002
-	swpNoZOrder      = 0x0004
-	swpNoActivate    = 0x0010
-	swpShowWindow    = 0x0040
-	swpNoOwnerZOrder = 0x0200
-
-	wmDestroy       = 2
 	wmMove          = 0x0003
 	wmSize          = 0x0005
 	wmNCCalcSize    = 0x0083
@@ -163,15 +150,13 @@ const (
 	dibRGBColors    = 0
 
 	wmAppFloatUpdate = 0x8001 // WM_APP+1:悬浮窗数据唤醒
+	wmClose          = 0x0010
 )
 
 // 运行期负值(int → uintptr 转换需符号扩展,不能写成常量转换)
 var (
-	hwndMessage = -3 // HWND_MESSAGE(保留)
 	hwndTopmost = -1 // HWND_TOPMOST
 	cchAll      = -1 // DrawTextW:以 NUL 结尾整串
-	fontHeight  = -13
-	gwLExStyle  = -20 // GetWindowLongW 的 GWL_EXSTYLE
 )
 
 // MSG 完整布局(x64,48 字节):GetMessageW 会写满整个结构,
@@ -227,99 +212,6 @@ func setColor(r, g, b uint8) uintptr {
 func roundCorners(hwnd uintptr) {
 	pref := uint32(dwmcpRound)
 	regCall(procDwmSetWindowAttribute, hwnd, dwmwaCornerPref, uintptr(unsafe.Pointer(&pref)), 4)
-}
-
-// mainHwnd 定位 Wails 主窗句柄。本进程顶层窗有三类:主窗、悬浮进度窗(工具窗,不可见/隐藏)、
-// 以及若干 WebView2 内部辅助窗(非工具窗但不可见,不上屏)。按"本进程 + 非工具窗 + 可见"
-// 判定,唯主窗三者皆中。不靠标题匹配——WebView2 加载后会把窗体标题改写为文档标题。
-// 找不到返回 0。
-func (a *App) mainHwnd() uintptr {
-	ourPID := uint32(os.Getpid())
-	var found uintptr
-	cb := syscall.NewCallback(func(hwnd, _ uintptr) uintptr {
-		var pid uint32
-		procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
-		if pid != ourPID {
-			return 1 // 非本进程窗口
-		}
-		ex := regCall(procGetWindowLongW, hwnd, uintptr(gwLExStyle))
-		if ex&wsExNoAct != 0 {
-			return 1 // 悬浮进度窗(带 WS_EX_NOACTIVATE);主窗两者皆无
-		}
-		if regCall(procIsWindowVisible, hwnd) == 0 {
-			return 1 // 不可见:WebView2 内部辅助窗(DWM 合成但不上屏)
-		}
-		found = hwnd // 主窗:本进程、无 NOACTIVATE、可见(工具窗隐藏态仍可见)
-		return 1
-	})
-	procEnumWindows.Call(cb, 0)
-	return found
-}
-
-// savedRect 缓存主窗隐藏前的位置与尺寸,唤起时原样移回(仅一个主窗,包级即可)。
-var savedRect struct{ l, t, w, h int32 }
-
-// hiddenToTray 主窗处于「关闭到托盘」的离屏隐藏态。只有此态唤起才按 savedRect 移回;
-// 正常可见时唤起绝不能动位置尺寸——savedRect 可能还是零值(会把窗口重置到 (0,0))。
-var hiddenToTray bool
-
-// winPosOnScreen 报告窗口矩形与虚拟桌面(所有显示器并集)是否有足够可见部分
-// (可见宽≥100、高≥60,足够抓住标题栏),防止拔掉显示器后把窗口恢复到
-// 不存在的屏幕上无法拖回。不满足时调用方应放弃记忆位置,回退居中默认。
-func winPosOnScreen(x, y, w, h int) bool {
-	const (
-		smXVirtual  = 76
-		smYVirtual  = 77
-		smCXVirtual = 78
-		smCYVirtual = 79
-	)
-	vx, vy := int(regCall(procGetSystemMetrics, smXVirtual)), int(regCall(procGetSystemMetrics, smYVirtual))
-	vw, vh := int(regCall(procGetSystemMetrics, smCXVirtual)), int(regCall(procGetSystemMetrics, smCYVirtual))
-	ix := max(min(x+w, vx+vw)-max(x, vx), 0)
-	iy := max(min(y+h, vy+vh)-max(y, vy), 0)
-	return ix >= 100 && iy >= 60
-}
-
-// hideToTray 关闭到托盘:记录窗口位置与尺寸后移出屏幕(-32000),再把扩展风格改为工具窗去
-// 任务栏图标。窗口保持 WS_VISIBLE,WebView2 不挂起,唤起不冻结;因未最小化,从任务栏等路径
-// 恢复不会残留工具窗形态,普通最小化按钮始终可用。
-func (a *App) hideToTray() {
-	h := a.mainHwnd()
-	if h == 0 {
-		return
-	}
-	var r [4]int32 // RECT{left, top, right, bottom}
-	procGetWindowRect.Call(h, uintptr(unsafe.Pointer(&r[0])))
-	savedRect.l, savedRect.t, savedRect.w, savedRect.h = r[0], r[1], r[2]-r[0], r[3]-r[1]
-	regCall(procSetWindowPos, h, 0, ^uintptr(32000), ^uintptr(32000), uintptr(savedRect.w), uintptr(savedRect.h), swpNoZOrder|swpNoOwnerZOrder|swpNoActivate)
-	ex := regCall(procGetWindowLongW, h, uintptr(gwLExStyle))
-	regCall(procSetWindowLongW, h, uintptr(gwLExStyle), (ex|wsExTool)&^wsExAppWindow)
-	a.offscreen = true // 离屏隐藏态:位置采样必须跳过(当前位置是屏外坐标)
-	hiddenToTray = true
-}
-
-// showToScreen 从托盘唤起:离屏隐藏态先还原为普通窗扩展风格(最小化/关闭按钮恢复),
-// 再把窗口移回隐藏前的位置并激活;正常可见(从未离屏)只置前,不动位置与尺寸。
-// 找不到句柄时(开机静默自启 StartHidden 的窗口从未上屏,枚举只认可见窗)退回 Wails
-// 原生显示——它持有自身窗体,首次唤起走 hasBeenShown 完整显示流程,同样不冻结。
-// 窗口隐藏期间保持 WS_VISIBLE,WebView2 不冻结,唤起即响应。
-func (a *App) showToScreen() {
-	a.offscreen = false
-	h := a.mainHwnd()
-	if h == 0 {
-		wruntime.WindowShow(a.wctx)
-		return
-	}
-	if !hiddenToTray {
-		regCall(procSetForegroundWindow, h)
-		return
-	}
-	hiddenToTray = false
-	ex := regCall(procGetWindowLongW, h, uintptr(gwLExStyle))
-	regCall(procSetWindowLongW, h, uintptr(gwLExStyle), (ex&^wsExTool)|wsExAppWindow)
-	regCall(procSetWindowPos, h, 0, uintptr(savedRect.l), uintptr(savedRect.t), uintptr(savedRect.w), uintptr(savedRect.h),
-		swpNoZOrder|swpNoOwnerZOrder|swpNoActivate|swpShowWindow)
-	regCall(procSetForegroundWindow, h)
 }
 
 // uiFonts 惰性创建并缓存三级字体(每 UI 线程一套,避免每次绘制泄漏 GDI 对象)
@@ -396,8 +288,9 @@ type floatSnapshot struct {
 	tasks        []floatTask
 }
 
-// FloatWindow 置顶小窗:总速度 + 进行中任务进度;设置 showFloatWindow 控制。
-// 可拖动移动、拖边缩放,位置与尺寸持久化(配置 floatX/Y/W/H)。
+// FloatWindow 置顶小窗:总速度 + 进行中任务进度;设置 showFloatWindow 控制,
+// 且只在有运行中/做种任务时上屏(无任务自动隐藏)。可拖动移动、拖边缩放,
+// 位置与尺寸持久化到引擎配置(floatX/Y/W/H)。
 type FloatWindow struct {
 	baseURL    string
 	onShow     func() // 打开管理界面
@@ -434,11 +327,9 @@ const (
 	floatRow    = 44
 	floatMaxRow = 4
 	floatHistN  = 60 // 速度历史样本数(秒)
-
-	wmClose = 0x0010
 )
 
-// CloseFloatWindow 退出流程调用:关闭悬浮窗,与托盘/主窗一起立即消失,
+// CloseFloatWindow 退出流程调用:关闭悬浮窗,与托盘一起立即消失,
 // 后台收尾期间不留残影。WM_CLOSE 投递到悬浮窗自己的 UI 线程销毁
 // (跨线程不直接碰窗口句柄);hwnd 创建后不再变化,退出路径直接读取。
 func CloseFloatWindow() {
@@ -446,16 +337,6 @@ func CloseFloatWindow() {
 		regCall(procPostMessageW, f.hwnd, wmClose, 0, 0)
 	}
 }
-
-// quitAssist Windows 的 Quit(PostQuitMessage)立即生效,无需辅助。
-func quitAssist() {}
-
-// registerSystemShutdownObserver Windows 无 NSWorkspace 通知占位:系统关机经
-// Win32 会话结束消息(WM_QUERYENDSESSION/WM_ENDSESSION)由 Wails 主循环原生处理。
-func registerSystemShutdownObserver() {}
-
-// setActivationPolicy Windows 无 Dock/激活策略概念,空实现(跨平台 OnStartup 引用)。
-func setActivationPolicy(regular bool) {}
 
 func NewFloatWindow(baseURL string, onShow, onSettings, onExit func()) *FloatWindow {
 	return &FloatWindow{baseURL: baseURL, onShow: onShow, onSettings: onSettings, onExit: onExit}
@@ -626,6 +507,7 @@ func (f *FloatWindow) uiLoop() {
 		return
 	}
 	floatWin = f
+	f.hwnd = hwnd // CloseFloatWindow 跨线程经此句柄投 WM_CLOSE,漏赋值会静默空转
 	f.w, f.h = floatW, floatHeader+floatRow
 	atomic.StoreUintptr(&f.hub, hwnd)
 
@@ -667,7 +549,7 @@ func floatWndProc(hwnd uintptr, m uint32, wp, lp uintptr) uintptr {
 		// (右键唤起菜单时最易触发)。返回非 0 阻止激活 → 彻底无边框。
 		return 1
 	case wmLButtonDblClk:
-		// 双击直接打开主界面(右键菜单里的"打开管理界面"同款行为)。
+		// 双击直接打开管理界面(右键菜单里的"打开管理界面"同款行为)。
 		// 主判定在 WM_LBUTTONDOWN 自计时;此处兜底(若系统仍合成双击消息)。
 		if f != nil {
 			f.lastClick = time.Time{}
@@ -739,7 +621,7 @@ func floatWndProc(hwnd uintptr, m uint32, wp, lp uintptr) uintptr {
 	case wmLButtonDown:
 		// 本窗是 WS_EX_NOACTIVATE 工具窗,系统不会为它合成 WM_LBUTTONDBLCLK,
 		// 故在 WM_LBUTTONDOWN 里自计时判双击:两次按下间隔 ≤ 500ms(Win 默认
-		// 双击间隔)即双击 → 开主界面;否则开始拖拽(光标不动则无位移)。
+		// 双击间隔)即双击 → 开管理界面;否则开始拖拽(光标不动则无位移)。
 		// 用 Go 单调钟而非 GetTickCount(在 kernel32 而非 user32,proc 解析
 		// 曾致本线程 panic),彻底避开 Win32 计时 proc。
 		if f == nil {
@@ -800,7 +682,12 @@ func floatWndProc(hwnd uintptr, m uint32, wp, lp uintptr) uintptr {
 			f.showMenu(hwnd)
 		}
 		return 0
-	case wmDestroy:
+	case wmClose:
+		// 退出流程投递的关闭:拦截成销毁(默认处理只对真实标题栏关闭生效)
+		regCall(procDestroyWindow, hwnd)
+		return 0
+	case 2: // wmDestroy
+		regCall(procPostQuitMessage, 0)
 		return 0
 	}
 	return regCall(procDefWindowProcW, hwnd, uintptr(m), wp, lp)
@@ -873,11 +760,13 @@ func (f *FloatWindow) apply(hwnd uintptr) {
 			rc := workArea()
 			f.x, f.y = rc.Right-floatW-8, rc.Top+8
 		}
-		// 保存的位置落在所有显示器之外(移除显示器等)则回默认位,防窗口失踪
+		// 仅当窗口整体落在所有显示器之外(与虚拟屏无交集、彻底失联)才回默认位。
+		// 此前按「任一边缘越界即重置」判断,拖到屏幕底边/右缘、或副屏拔除后残留
+		// 一角都会被误判→整个窗口弹回左上默认位,即"偶尔变回原位置"的观感来源
 		vx, vy, vw, vh := virtualScreen()
-		if f.x < vx || f.y < vy || f.x+f.w > vx+vw || f.y+f.h > vy+vh {
+		if f.x+f.w <= vx || f.x >= vx+vw || f.y+f.h <= vy || f.y >= vy+vh {
 			rc := workArea()
-			f.x, f.y = rc.Right-floatW-8, rc.Top+8
+			f.x, f.y = rc.Right-f.w-8, rc.Top+8
 		}
 		f.posSet = true
 	}
@@ -1154,22 +1043,36 @@ func drawSpeedChart(f *FloatWindow, hdc uintptr, x0, x1 int32) {
 		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&bmi)), dibRGBColors, srccopy)
 }
 
-// savePos 拖动/缩放结束后把位置与尺寸持久化到配置(走既有 HTTP 接口)。
+// savePos 拖动/缩放结束后把位置与尺寸持久化到引擎配置(走既有 HTTP 接口,
+// PUT /api/config 是合并式部分更新,只带浮窗四字段)。
 func (f *FloatWindow) savePos(x, y, w, h int32) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	body := `{"floatX":` + strconv.FormatInt(int64(x), 10) +
 		`,"floatY":` + strconv.FormatInt(int64(y), 10) +
 		`,"floatW":` + strconv.FormatInt(int64(w), 10) +
 		`,"floatH":` + strconv.FormatInt(int64(h), 10) + `,"floatPosSet":true}`
-	req, err := http.NewRequest(http.MethodPut, f.baseURL+"/api/config", strings.NewReader(body))
-	if err != nil {
-		return
+	// 瞬时失败(引擎忙碌/恰在重启、回环拥塞)不再静默吞掉:重试两次,仍失败才记日志。
+	// 静默吞错会让本次拖动的位置永远没落进配置,重启后悬浮窗回弹到旧位/默认位;
+	// 本函数总在 goroutine 里调用(见 wmLButtonUp/wmExitSizeMove),重试可放心阻塞
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+		req, err := http.NewRequest(http.MethodPut, f.baseURL+"/api/config", strings.NewReader(body))
+		if err != nil {
+			lastErr = err
+			break
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			return
+		}
+		lastErr = err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err == nil {
-		resp.Body.Close()
-	}
+	log.Printf("[float] 悬浮窗位置持久化失败: %v", lastErr)
 }
 
 func fmtBytes(n int64) string {

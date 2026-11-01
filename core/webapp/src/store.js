@@ -123,13 +123,24 @@ export async function deleteRecentDir(dir) {
 }
 
 /* ---------------- 文件夹选择 ---------------- */
+// 双形态:/api/pickdir 已随无头化裁撤。Wails 壳(webview)经 JS 桥弹原生对话
+// 框;浏览器模式拿不到文件系统路径(安全模型),提示手输路径/用下拉里的最近
+// 目录(DirField)。
+export const wailsApp = () => (typeof window !== "undefined" && window.go && window.go.main && window.go.main.App) || null;
+
 export async function pickDir(title = "选择下载文件夹") {
-  try {
-    return await api("POST", "/api/pickdir", { title });
-  } catch (e) {
-    showErr(e);
-    return { ok: false };
+  const app = wailsApp();
+  if (app && app.PickDirDialog) {
+    try {
+      const p = await app.PickDirDialog(title);
+      return p ? { ok: true, path: p } : { ok: false };
+    } catch (e) {
+      showErr(e);
+      return { ok: false };
+    }
   }
+  toast("浏览器模式不支持目录选择:请直接输入路径,或从目录框下拉里选最近目录", "warn");
+  return { ok: false };
 }
 
 /* ---------------- 视图过滤 ---------------- */
@@ -212,6 +223,10 @@ export function connectSSE() {
       } else if (msg.type === "openNewTask") {
         // 核心通知「有待弹新建任务窗」:取走持久槽再弹(见 fetchPendingNewTask)
         fetchPendingNewTask();
+      } else if (msg.type === "uiShow" && msg.settings) {
+        // uiShow 的 settings=1(托盘「设置」/直达设置页):窗口置前由桌面壳的
+        // Go 侧处理,导航(打开设置弹层)归前端——旧架构由 Fyne/守护侧代做
+        if (store.actions.openSettings) store.actions.openSettings();
       }
     } catch (_) { /* 忽略坏帧 */ }
   };

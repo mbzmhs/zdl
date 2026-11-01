@@ -15,10 +15,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"zdownloader/internal/assoc"
-	"zdownloader/internal/autostart"
 	"zdownloader/internal/bt"
 	"zdownloader/internal/engine"
 	"zdownloader/internal/hub"
@@ -30,15 +29,18 @@ import (
 const Version = "1.8.0"
 
 type Server struct {
-	mgr    *engine.Manager
-	hub    *hub.Hub
-	web    fs.FS
-	ShowUI func(settings bool) // 桌面端注入:唤起原生窗口(settings=直达设置页);网页版为 nil
-	// SaveTorrent 桌面端注入:弹原生"另存为"对话框写入种子,返回落盘路径;网页版为 nil
-	SaveTorrent func(data []byte, suggestedName string) (string, error)
-	// PickDir 桌面端注入:弹原生"选择文件夹"对话框(Wails OpenDirectoryDialog,跨平台),
-	// 用户取消时 ok=false;未注入(无桌面窗)时报不支持。
-	PickDir func(title string) (path string, ok bool, err error)
+	mgr *engine.Manager
+	hub *hub.Hub
+	web fs.FS
+	// OnExit 引擎进程收尾钩子(zdl main 注入 ctx cancel):/api/shutdown 走完
+	// 存盘后结束进程。引擎已无头化,生命周期完全由常驻组件(shell)驱动。
+	OnExit func()
+	// ShowUI 可选唤起钩子:Wails 单体内嵌壳注入(扩展/转交直接弹它的窗口);
+	// 无头引擎(zdl)不注入,走 uiShow 中继由订阅 SSE 的桌面端自行响应。
+	ShowUI func(settings bool)
+	// uiClients 经 SSE ?client=ui 自报家门的 UI 进程连接数:/api/ui/show 据此
+	// 如实回 ok/desktop|web,浏览器扩展无桌面 UI 时回退为浏览器打开管理页。
+	uiClients atomic.Int64
 
 	// 待打开建任务窗的单槽:浏览器扩展(右键/快加/嗅探)请求弹「新建任务」窗时
 	// 写入,前端在窗口获焦/重连/收到 openNewTask 帧时 GET 消费一次再弹窗。
@@ -142,7 +144,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks", s.handleCreate)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleGet)
 	mux.HandleFunc("GET /api/tasks/{id}/torrent", s.handleExportTorrent)
-	mux.HandleFunc("POST /api/tasks/{id}/save-torrent", s.handleSaveTorrent)
 	mux.HandleFunc("PUT /api/tasks/{id}", s.handleUpdateTask)
 	mux.HandleFunc("DELETE /api/tasks/{id}", s.handleDelete)
 	mux.HandleFunc("POST /api/tasks/{id}/{action}", s.handleAction)
@@ -181,19 +182,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/log", s.handleLog)
 	mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
-	mux.HandleFunc("POST /api/pickdir", s.handlePickDir)
+	mux.HandleFunc("GET /api/sysproxy", s.handleSysProxy)
 	mux.HandleFunc("POST /api/recentdir", s.handleAddRecentDir)
 	mux.HandleFunc("POST /api/recentdir/delete", s.handleDeleteRecentDir)
 	mux.HandleFunc("POST /api/probe", s.handleProbe)
-	mux.HandleFunc("GET /api/autostart", s.handleAutostartGet)
-	mux.HandleFunc("POST /api/autostart", s.handleAutostartSet)
-	mux.HandleFunc("GET /api/assoc", s.handleAssocGet)
-	mux.HandleFunc("POST /api/assoc", s.handleAssocSet)
-	mux.HandleFunc("POST /api/assoc/opensettings", s.handleAssocOpenSettings)
-	mux.HandleFunc("GET /api/sysproxy", s.handleSysProxy)
 	mux.HandleFunc("GET /api/goroutines", s.handleGoroutines)
 	mux.HandleFunc("GET /api/ui/show", s.handleShowUI)
 	mux.HandleFunc("POST /api/ui/show", s.handleShowUI)
+	mux.HandleFunc("POST /api/shutdown", s.handleShutdown)
+	mux.HandleFunc("POST /api/uiState", s.handleUIState)
 	mux.HandleFunc("POST /api/ui/newtask", s.handleOpenNewTask)
 	mux.HandleFunc("GET /api/ui/newtask", s.handleTakeNewTask)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
@@ -237,12 +234,29 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		fl.Flush()
 	}
 
+	// UI 进程自报家门(?client=ui):供 /api/ui/show 判断是否有桌面 UI 可唤
+	if r.URL.Query().Get("client") == "ui" {
+		s.uiClients.Add(1)
+		defer s.uiClients.Add(-1)
+	}
+
 	ch, cancel := s.hub.Subscribe()
 	defer cancel()
+	// 保活心跳:SSE 空闲期(无任务变化=零帧)会被部分网络环境当作死连接回收
+	// (实测:回环连接静默数分钟即被掐,引擎误判 UI 离线,托盘中继退化成
+	// "拉新进程"慢路径,唤窗延迟数秒)。": ping" 是 SSE 规范的注释帧,全部
+	// 消费方(浏览器 EventSource / Go 侧 Scanner)读入后按行忽略。
+	ping := time.NewTicker(15 * time.Second)
+	defer ping.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-ping.C:
+			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+				return
+			}
+			fl.Flush()
 		case msg, ok := <-ch:
 			if !ok {
 				return // hub CloseAll(退出流程):立即收尾连接,让 Shutdown 不用干等
@@ -284,27 +298,6 @@ func (s *Server) handleExportTorrent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-bittorrent")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	_, _ = w.Write(data)
-}
-
-// handleSaveTorrent 「另存为种子」:取任务内部存档的种子字节,交桌面端弹原生
-// "另存为"对话框(见 App.SaveTorrent)落盘,返回用户实际保存的路径。走原生对话框
-// 而非 webview 内置下载:用户能自选保存位置,下载不落进浏览器/WebView 下载目录。
-func (s *Server) handleSaveTorrent(w http.ResponseWriter, r *http.Request) {
-	if s.SaveTorrent == nil {
-		writeErr(w, http.StatusNotImplemented, "当前环境不支持另存为种子(需桌面版)")
-		return
-	}
-	filename, data, err := s.mgr.ExportTorrent(r.PathValue("id"))
-	if err != nil {
-		writeErr(w, statusFor(err), err.Error())
-		return
-	}
-	path, err := s.SaveTorrent(data, filename)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path})
 }
 
 // handleTaskDetail 任务详情侧边栏快照。
@@ -729,8 +722,10 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// 置前原生窗口。窗口被隐藏时 WebView2 会挂起窗口内 JS,SSE/轮询不被唤醒,
 	// 若靠前端发现新任务再唤窗,隐藏实例会一直卡在隐藏态(双击种子文件唤不
 	// 出主界面即此)。故服务端直接唤窗,再交由已唤醒的前端弹创建对话框。
-	if req.Choose && s.ShowUI != nil {
-		s.ShowUI(false)
+	if req.Choose {
+		// 无头引擎不认识窗口:广播 uiShow 帧,由订阅 SSE 的 zdlui 显示自己
+		// (未驻留时由常驻组件负责拉起)
+		s.hub.Broadcast(UIShowFrame(false))
 	}
 	writeJSON(w, http.StatusOK, createResp{Tasks: views, Errors: errs})
 }
@@ -808,8 +803,10 @@ func (s *Server) handleCreateBT(w http.ResponseWriter, r *http.Request) {
 	views, errs := s.mgr.AddBT(req)
 	// 关联启动转发/磁链建任务(Choose=需选保存目录):服务端直接唤窗取焦。
 	// 隐藏实例的窗口 JS 被挂起,不会自己发现新任务再唤窗,须由此处兜底唤起。
-	if req.Choose && s.ShowUI != nil {
-		s.ShowUI(false)
+	if req.Choose {
+		// 无头引擎不认识窗口:广播 uiShow 帧,由订阅 SSE 的 zdlui 显示自己
+		// (未驻留时由常驻组件负责拉起)
+		s.hub.Broadcast(UIShowFrame(false))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": len(errs) == 0, "tasks": views, "errors": errs})
 }
@@ -991,25 +988,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.mgr.Stats())
 }
 
-// handlePickDir 打开系统原生"选择文件夹"对话框(对话框出现在核心所在桌面)。
-func (s *Server) handlePickDir(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Title string `json:"title"`
-	}
-	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req)
-	if req.Title == "" {
-		req.Title = "选择下载文件夹"
-	}
-	if s.PickDir == nil {
-		writeErr(w, http.StatusInternalServerError, "当前平台不支持图形化选择文件夹,请手动输入路径")
-		return
-	}
-	path, ok, err := s.PickDir(req.Title)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "path": path})
+// handleSysProxy 回显"跟随系统"实际检测到的代理,供前端(设置页只读回显)展示。
+// Wails/浏览器走 Vue 前端,经此接口实时读系统代理;Fyne 原生设置页则进程内直调
+// proxy.FollowSystemStatus()。字段(source/envVar/addr/url)与前端 refreshFollowProxy
+// 读取的键一一对应,未检测到时 source 为空串,前端据此回显"未检测到代理(将直连)"。
+func (s *Server) handleSysProxy(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, proxy.FollowSystemStatus())
 }
 
 // handleAddRecentDir 记录最近使用的保存目录(前端在创建任务成功后调用,只记
@@ -1033,7 +1017,6 @@ func (s *Server) handleDeleteRecentDir(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "recentDirs": cfg.RecentDirs})
 }
 
-// handleAutostartGet 返回开机自启当前状态(注册表 Run 键)。
 // handleProbe 预解析下载链接(合法性/文件名/大小/断点续传),供新建任务对话框实时提示。
 func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -1051,16 +1034,6 @@ func (s *Server) handleProbe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.mgr.Probe(ctx, req.URL, req.Referer, req.Headers, req.Proxy))
 }
 
-func (s *Server) handleAutostartGet(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"enabled": autostart.Enabled()})
-}
-
-// handleSysProxy 实时检测"跟随系统"代理(环境变量 / Windows 系统代理),
-// 供设置页只读回显。
-func (s *Server) handleSysProxy(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, proxy.FollowSystemStatus())
-}
-
 // handleGoroutines 全量 goroutine 转储(诊断拨号/会话卡死用)。
 func (s *Server) handleGoroutines(w http.ResponseWriter, r *http.Request) {
 	buf := make([]byte, 4<<20)
@@ -1069,82 +1042,106 @@ func (s *Server) handleGoroutines(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(buf[:n])
 }
 
-// handleAutostartSet 开启/关闭开机自启 {enabled: true|false}。
-func (s *Server) handleAutostartSet(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
-		return
-	}
-	var err error
-	if req.Enabled {
-		err = autostart.Enable()
-	} else {
-		err = autostart.Disable()
-	}
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": req.Enabled})
-}
-
-// handleAssocGet 文件关联当前状态(注册表实况:命令指向本程序且无
-// 系统级 UserChoice 覆盖时才视为已关联;macOS 为 LaunchServices 真实
-// 默认应用查询)。platform 供前端按平台切换交互形态。
-func (s *Server) handleAssocGet(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"magnet":   assoc.MagnetEnabled(),
-		"torrent":  assoc.TorrentEnabled(),
-		"platform": runtime.GOOS,
-	})
-}
-
-// handleAssocSet 应用文件关联 {magnet:bool, torrent:bool};幂等,重复
-// 开启会刷新命令中的程序路径(程序移动/升级覆盖后自愈)。返回注册表
-// 实况供前端校正开关显示。
-func (s *Server) handleAssocSet(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Magnet  bool `json:"magnet"`
-		Torrent bool `json:"torrent"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
-		return
-	}
-	if err := assoc.Set(req.Magnet, req.Torrent); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"magnet":   assoc.MagnetEnabled(),
-		"torrent":  assoc.TorrentEnabled(),
-		"platform": runtime.GOOS,
-	})
-}
-
-// handleAssocOpenSettings 打开系统「默认应用」设置页(Mac=桌面与程序坞,
-// Windows=ms-settings:defaultapps)。关联确认弹窗错过/取消时的兜底入口。
-func (s *Server) handleAssocOpenSettings(w http.ResponseWriter, r *http.Request) {
-	if err := assoc.OpenSystemSettings(); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// handleShowUI 唤起桌面端原生窗口;网页版没有窗口,返回 ok:false,
-// 扩展据此回退为在浏览器打开管理页。
+// handleShowUI 唤起桌面 UI。引擎已无头化、不认识任何窗口:把唤起请求以
+// uiShow 帧广播给订阅 SSE 的 zdlui(常驻隐藏时秒回;未驻留时由常驻组件
+// shell 拉起新 zdlui)。有无附着 UI 经 SSE ?client=ui 计数判断,无 UI 时
+// 如实回 ui:web,浏览器扩展据此回退为在浏览器打开管理页。
 func (s *Server) handleShowUI(w http.ResponseWriter, r *http.Request) {
-	if s.ShowUI != nil {
-		s.ShowUI(r.URL.Query().Get("settings") == "1")
+	settings := r.URL.Query().Get("settings") == "1"
+	if s.ShowUI != nil { // 内嵌壳:窗口同进程,直接弹
+		s.ShowUI(settings)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ui": "desktop"})
+		return
+	}
+	// 广播按附着状态分流:有 UI → uiShow(窗口进程置前自己);无 UI → uiSpawn
+	// (常驻组件拉起新窗口进程)。两种帧消费者不同,绝不互答——否则 shell 响应
+	// uiShow 调本接口再广播 uiShow,回环疯狂唤窗(实测)
+	attached := s.uiClients.Load() > 0
+	s.hub.Broadcast(s.uiSummonFrame(settings, attached))
+	if attached {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ui": "desktop"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": false, "ui": "web"})
+}
+
+// uiSummonFrame 按附着状态选帧:attached=uiShow(窗口置前)/ 否则 uiSpawn(拉起)
+func (s *Server) uiSummonFrame(settings, attached bool) []byte {
+	if attached {
+		return UIShowFrame(settings)
+	}
+	return UISpawnFrame(settings)
+}
+
+// handleShutdown 引擎优雅退出(常驻组件托盘「退出」调用):先广播 uiExit 让
+// UI 进程自行收尾,再停 SSE/服务、存任务,最后经 OnExit 结束进程。zdl 无头化
+// 后没有托盘,这是引擎唯一的退出入口。
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	s.hub.Broadcast(UIExitFrame)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	go func() {
+		s.CloseSSE()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.mgr.Shutdown(shutdownCtx)
+		if s.OnExit != nil {
+			s.OnExit()
+		}
+	}()
+}
+
+// UIShowFrame 构造「唤起 UI 窗口」的 SSE 帧(settings=直达设置页)。分离架构下
+// UI 是独立进程,守护侧 ShowUI 钩子对已驻留的隐藏 UI 只能经 SSE 送达唤起请求
+// (入口层 daemon.go 直接广播,故导出)。
+func UIShowFrame(settings bool) []byte {
+	return []byte("data: " + fmt.Sprintf(`{"type":"uiShow","settings":%v}`, settings) + "\n\n")
+}
+
+// handleUIState UI 进程回写界面状态(窗口位置/侧栏视图/主题),守护侧落盘到
+// config:分离架构下 UI 只是 API 客户端,窗口位置、当前视图、主题这些跨会话
+// 状态统一经此汇入守护配置,新 UI 进程启动时经 GET /api/config 取回恢复。
+// 字段按需更新:零值字段跳过,避免部分回写互相覆盖。
+func (s *Server) handleUIState(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	var req struct {
+		WinX, WinY, WinW, WinH int
+		WinPosSet              bool
+		View, Theme            string
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json"})
+		return
+	}
+	if req.WinPosSet && req.WinW > 0 && req.WinH > 0 {
+		s.mgr.UpdateWindowPos(req.WinX, req.WinY, req.WinW, req.WinH)
+	}
+	if req.View != "" {
+		s.mgr.UpdateLastView(req.View)
+	}
+	if req.Theme != "" {
+		s.mgr.UpdateTheme(req.Theme)
+		// 主题变化随 SSE 广播,常驻组件(托盘)据此同步菜单明暗
+		s.hub.Broadcast(themeFrame(req.Theme))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// UIExitFrame 通知 UI 进程「守护即将退出,请关闭自己」的轻量 SSE 帧:分离架构
+// 下守护退出时 UI 进程若继续存活,会变成指向死接口的孤儿窗口,故退出前广播
+// 一帧让 UI 进程自行收尾(存位置、卸钩子、退进程)。窗口隐藏时本帧可能丢,
+// 兜底是守护最后 kill 子进程。(入口层 daemon.go 直接广播,故导出)
+var UIExitFrame = []byte("data: " + `{"type":"uiExit"}` + "\n\n")
+
+// UISpawnFrame 唤起帧的无 UI 变体:消费者是常驻组件(拉起新窗口进程),
+// 与 uiShow(消费者是已附着的窗口进程,置前自己)严格分离,防止 shell 响应
+// uiShow 调 /api/ui/show 再广播 uiShow 的回环
+func UISpawnFrame(settings bool) []byte {
+	return []byte("data: " + fmt.Sprintf(`{"type":"uiSpawn","settings":%v}`+"\n\n", settings))
+}
+
+// themeFrame 主题变化帧:常驻组件(托盘菜单明暗跟随)与任意感兴趣方消费
+func themeFrame(theme string) []byte {
+	return []byte("data: " + fmt.Sprintf(`{"type":"theme","theme":%q}`+"\n\n", theme))
 }
 
 // openNewTaskFrame 是提示前端「去取槽弹窗」的轻量 SSE 帧:不带负载,仅唤醒前端
@@ -1197,9 +1194,7 @@ func (s *Server) handleOpenNewTask(w http.ResponseWriter, r *http.Request) {
 		Magnet: magnet, TorrentPath: tpath, Dir: strings.TrimSpace(req.Dir),
 	}
 	s.ntMu.Unlock()
-	if s.ShowUI != nil {
-		s.ShowUI(false)
-	}
+	s.hub.Broadcast(s.uiSummonFrame(false, s.uiClients.Load() > 0))
 	s.hub.Broadcast(openNewTaskFrame)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1207,6 +1202,14 @@ func (s *Server) handleOpenNewTask(w http.ResponseWriter, r *http.Request) {
 // handleTakeNewTask 消费一次待办:取走并清空槽。前端据 urls 是否为空决定弹窗;
 // 消费一次保证「关窗后重连不会再把同一请求重新弹出来」。
 func (s *Server) handleTakeNewTask(w http.ResponseWriter, r *http.Request) {
+	// 消费权归桌面端:Wails webview 的请求 UA 带 wails.io 标记(资产服务器统
+	// 一附加),Fyne 客户端自报 ZDownloader-Desktop;浏览器标签(同为 Vue+SSE)
+	// 一律探询到空且不消费——否则双击种子的目标会被恰好开着的浏览器截胡,
+	// 桌面窗反而不弹
+	if ua := r.UserAgent(); !strings.Contains(ua, "wails.io") && !strings.Contains(ua, "ZDownloader-Desktop") {
+		writeJSON(w, http.StatusOK, map[string]any{"urls": []string{}})
+		return
+	}
 	s.ntMu.Lock()
 	p := s.ntPending
 	s.ntPending = nil
@@ -1236,9 +1239,7 @@ func (s *Server) QueueBootstrapTarget(target string) {
 	s.ntMu.Lock()
 	s.ntPending = p
 	s.ntMu.Unlock()
-	if s.ShowUI != nil {
-		s.ShowUI(false)
-	}
+	s.hub.Broadcast(s.uiSummonFrame(false, s.uiClients.Load() > 0))
 	s.hub.Broadcast(openNewTaskFrame)
 }
 
@@ -1250,9 +1251,7 @@ func (s *Server) QueueSeedConflict(name, torrentPath, dir string) {
 	s.ntMu.Lock()
 	s.ntPending = &newTaskPending{SeedConflict: true, SeedName: name, TorrentPath: torrentPath, Dir: dir, Generated: true}
 	s.ntMu.Unlock()
-	if s.ShowUI != nil {
-		s.ShowUI(false)
-	}
+	s.hub.Broadcast(UIShowFrame(false))
 	s.hub.Broadcast(openNewTaskFrame)
 }
 
@@ -1274,6 +1273,11 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "接口不存在")
 		return
 	}
+	// 原生壳(v3)不嵌入 Web UI:web 为 nil 时静态区整体 404,仅 API 可用
+	if s.web == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	p := strings.TrimPrefix(r.URL.Path, "/")
 	if p == "" {
 		p = "index.html"
@@ -1292,6 +1296,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, name string) {
+	if s.web == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
 	f, err := s.web.Open(name)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)

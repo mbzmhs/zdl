@@ -52,7 +52,9 @@ func TestEnableDisableRoundtrip(t *testing.T) {
 	}
 }
 
-// 启动命令必须带引号(路径含空格)且附 -no-browser。
+// 启动命令必须带引号(路径含空格),且不带任何参数:zdl_shell 本就是常驻托盘,
+// 裸启动即其本征形态。历史上误附 "-tray",Go 的 flag.Parse 遇未定义参数会
+// os.Exit(2),导致登录时静默退出、托盘拉不起来——此处守卫该回归。
 func TestCommandStringQuoted(t *testing.T) {
 	cmd, err := commandString()
 	if err != nil {
@@ -62,7 +64,10 @@ func TestCommandStringQuoted(t *testing.T) {
 	if !strings.HasPrefix(cmd, `"`+exe+`"`) {
 		t.Fatalf("命令应以带引号的 exe 路径开头: %q", cmd)
 	}
-	if !strings.HasSuffix(cmd, "-no-browser") {
-		t.Fatalf("命令应附 -no-browser: %q", cmd)
+	if !strings.HasSuffix(cmd, `"`) {
+		t.Fatalf("命令结尾即闭合引号,不应再附任何参数: %q", cmd)
+	}
+	if strings.Contains(cmd, "tray") {
+		t.Fatalf("命令不应附 -tray(zdl_shell 恒为常驻托盘): %q", cmd)
 	}
 }

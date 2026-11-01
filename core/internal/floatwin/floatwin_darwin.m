@@ -1,5 +1,5 @@
-// float_darwin.m — macOS 悬浮窗(NSPanel + WKWebView)实现,被 float_darwin.go 引用。
-#import "float_darwin.h"
+// floatwin_darwin.m — macOS 悬浮窗(NSPanel + WKWebView)实现,被 floatwin_darwin.go 引用。
+#import "floatwin_darwin.h"
 #import <AppKit/AppKit.h>
 #import <dispatch/dispatch.h>
 
@@ -7,9 +7,38 @@ static NSPanel *zdFloatPanel = nil;
 static WKWebView *zdFloatWebView = nil;
 static NSObject<NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler> *zdFloatDelegate = nil;
 static NSMenu *zdFloatMenu = nil;
+// 原生拖拽状态(见 ZDFloatDelegate startNativeDrag)
+static NSPoint zdDragGrabOffset;   // 光标 → 面板 origin 的抓取偏移
+static id zdDragMonitor = nil;     // 左键拖拽/抬起的本地事件监视器
+static BOOL zdNativeDragging = NO;
 
 // 默认尺寸/位置:右上角贴菜单栏下方(位置记忆无效时用)
 static NSSize zdFloatDefaultSize(void) { return NSMakeSize(288, 142); }
+
+// 钳进单一屏幕的可见区:目标屏取面板中心所在屏(在屏间隙则取最近屏)。
+// 不允许面板骑在交界上——骑界时 window 的 backing scale 随两屏反复切换,
+// 透明 WKWebView 每次切换都重栅格化一帧,视觉上就是交界处疯狂闪烁(实测);
+// 整体钳进单屏后 scale 只在跨屏瞬间切换一次。顺带保证面板永不被拖丢。
+static NSPoint zdClampedOrigin(NSPoint o) {
+    NSRect f = zdFloatPanel.frame;
+    NSPoint center = NSMakePoint(o.x + f.size.width / 2, o.y + f.size.height / 2);
+    NSScreen *target = nil;
+    CGFloat best = CGFLOAT_MAX;
+    for (NSScreen *s in [NSScreen screens]) {
+        NSRect fr = s.frame;
+        if (NSMouseInRect(center, fr, NO)) { target = s; break; }
+        // 屏间隙:按到屏框中心的距离取最近
+        CGFloat dx = MAX(MAX(fr.origin.x - center.x, center.x - (fr.origin.x + fr.size.width)), 0);
+        CGFloat dy = MAX(MAX(fr.origin.y - center.y, center.y - (fr.origin.y + fr.size.height)), 0);
+        CGFloat d = dx * dx + dy * dy;
+        if (d < best) { best = d; target = s; }
+    }
+    if (target == nil) { return o; }
+    NSRect v = target.visibleFrame;
+    o.x = MIN(MAX(o.x, v.origin.x), v.origin.x + v.size.width - f.size.width);
+    o.y = MIN(MAX(o.y, v.origin.y), v.origin.y + v.size.height - f.size.height);
+    return o;
+}
 
 @interface ZDFloatDelegate : NSObject <NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler>
 - (void)openUI:(id)sender;
@@ -17,27 +46,57 @@ static NSSize zdFloatDefaultSize(void) { return NSMakeSize(288, 142); }
 - (void)quitApp:(id)sender;
 @end
 @implementation ZDFloatDelegate
-// JS 拖拽:{act:"drag", dx, dy, end} — dx 向右/dy 向下为正(屏幕坐标),
-// cocoa 的 y 轴向上,故 origin.y -= dy;end=true 时回存位置。
-// 不用 movableByWindowBackground:WKWebView 自消费鼠标事件,该机制对它无效。
+// 拖拽分两段:JS mousedown 后的首条 drag 消息只当「拖拽起点」信号,此后位置
+// 完全由原生事件驱动——以全局光标坐标(NSEvent mouseLocation,与 webview
+// 坐标系无关)减抓取偏移定位。原先 JS 增量(e.screenX 差值)+ setFrameOrigin
+// 是个反馈环:跨屏(backing scale 变化)时 webview 上报的 screen 坐标跳变,
+// dx/dy 出尖峰,面板乱跳又反过来让下一次 screen 读数更歪——实测跨屏拖动
+// 疯狂闪烁乱移动。拖拽期间本地监视器吞掉拖拽事件(不再回喂 JS),windowDidMove
+// 静默,松手才回存一次位置。
+- (void)startNativeDrag {
+    if (zdNativeDragging || zdFloatPanel == nil) { return; }
+    NSPoint cursor = [NSEvent mouseLocation];
+    zdDragGrabOffset = NSMakePoint(cursor.x - zdFloatPanel.frame.origin.x,
+                                   cursor.y - zdFloatPanel.frame.origin.y);
+    zdNativeDragging = YES;
+    zdDragMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:
+        NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp
+        handler:^NSEvent *(NSEvent *e) {
+            if (e.type == NSEventTypeLeftMouseUp) {
+                [self endNativeDrag];
+                return e; // 放行抬起事件,让 JS 归位自己的 drag 状态
+            }
+            NSPoint o = zdClampedOrigin(NSMakePoint(
+                [NSEvent mouseLocation].x - zdDragGrabOffset.x,
+                [NSEvent mouseLocation].y - zdDragGrabOffset.y));
+            [zdFloatPanel setFrameOrigin:o];
+            return nil; // 吞掉拖拽事件:webview 不再产生 JS 增量消息
+        }];
+}
+- (void)endNativeDrag {
+    if (!zdNativeDragging) { return; }
+    if (zdDragMonitor != nil) { [NSEvent removeMonitor:zdDragMonitor]; zdDragMonitor = nil; }
+    zdNativeDragging = NO;
+    if (zdFloatPanel == nil) { return; }
+    NSRect f = zdFloatPanel.frame;
+    zdFloatOnMove((int)f.origin.x, (int)(f.origin.y + f.size.height), (int)f.size.width, (int)f.size.height);
+}
 - (void)userContentController:(WKUserContentController *)userContentController
       didReceiveScriptMessage:(WKScriptMessage *)message {
     if (![message.name isEqualToString:@"zdfloat"] || zdFloatPanel == nil) { return; }
     NSDictionary *d = (NSDictionary *)message.body;
     if (![d[@"act"] isEqualToString:@"drag"]) { return; }
-    CGFloat dx = [d[@"dx"] doubleValue];
-    CGFloat dy = [d[@"dy"] doubleValue];
-    NSRect f = zdFloatPanel.frame;
-    f.origin.x += dx;
-    f.origin.y -= dy;
-    [zdFloatPanel setFrameOrigin:f.origin];
     if ([d[@"end"] boolValue]) {
-        zdFloatOnMove((int)f.origin.x, (int)(f.origin.y + f.size.height), (int)f.size.width, (int)f.size.height);
+        [self endNativeDrag]; // JS 抬起收尾(原生监视器已先收尾则幂等)
+        return;
     }
+    if (zdNativeDragging) { return; } // 原生拖拽进行中:JS 增量一律忽略
+    [self startNativeDrag];
 }
-// 拖动结束回存位置(左上角 + 宽高,Cocoa 全局坐标)
+// 程序性 setFrameOrigin(原生拖拽/调高)同样会走到这里;原生拖拽期间的回存
+// 由 endNativeDrag 统一做,这里跳过避免逐事件 HTTP PUT
 - (void)windowDidMove:(NSNotification *)notification {
-    if (zdFloatPanel == nil) { return; }
+    if (zdFloatPanel == nil || zdNativeDragging) { return; }
     NSRect f = zdFloatPanel.frame;
     zdFloatOnMove((int)f.origin.x, (int)(f.origin.y + f.size.height), (int)f.size.width, (int)f.size.height);
 }
@@ -185,60 +244,6 @@ void zdFloatCreateC(const char *url, int x, int y, int w, int h, int posSet) {
     });
 }
 
-// zdAppQuitAssistC 退出辅助,主线程同步执行:全部窗口 orderOut(主窗立即消失,
-// 不依赖 wails WindowHide 的异步时序)+ NSApp stop + post 哑事件(atStart)。
-// [NSApp stop:] 语义是"处理完下一个事件才退出"——应用闲置无事件时循环一直
-// 转着,主窗/托盘收了但循环迟迟不退;哑事件就是那个"下一个事件"。
-void zdAppQuitAssistC(void) {
-    dispatch_sync(dispatch_get_main_queue(), ^{
-        for (NSWindow *w in [NSApp windows]) {
-            [w orderOut:nil];
-        }
-        [NSApp stop:nil];
-        NSEvent *wake = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
-                                           location:NSMakePoint(0, 0)
-                                      modifierFlags:0
-                                          timestamp:0
-                                       windowNumber:0
-                                            context:nil
-                                            subtype:0
-                                              data1:0
-                                              data2:0];
-        [NSApp postEvent:wake atStart:YES];
-    });
-}
-
-// zdAppRegisterShutdownObserverC 观察系统关机/重启:
-// macOS 关机/重启前,NSWorkspace 向所有 GUI 应用(与窗口是否可见无关)送达
-// WillPowerOff/WillRestart 通知,这是"系统要求退出"的可靠信号。
-// Wails v2 的 applicationShouldTerminate 恒返回 NSTerminateCancel——系统侧
-// 的退出请求被拒,只能等应用自己退出;托盘常驻模式下应用只是隐藏到托盘、
-// 永远不退出,宽限期一到即被强杀,弹出"ZDownloader 中断了关机"。
-// 收到通知即回调 Go 侧走与 SIGTERM 相同的优雅退出流程(根上下文取消 →
-// 后台保存任务状态 → 进程退出),在系统宽限期内完成。
-// 睡眠(WillSleep)无需处理:系统不要求应用退出即可睡眠。
-static id zdShutdownObserverPowerOff = nil;
-static id zdShutdownObserverRestart = nil;
-
-void zdAppRegisterShutdownObserverC(void) {
-    NSNotificationCenter *nc = [[NSWorkspace sharedWorkspace] notificationCenter];
-    // 关机:公开常量。
-    zdShutdownObserverPowerOff = [nc addObserverForName:NSWorkspaceWillPowerOffNotification
-                                                  object:nil queue:nil
-                                              usingBlock:^(NSNotification *note) {
-        zdAppOnSystemShutdown();
-    }];
-    [zdShutdownObserverPowerOff retain]; // 非 ARC:块观察者须显式持有
-    // 重启:WillRestart 是私有通知,公开 SDK 头无常量;NSWorkspace 通知常量
-    // 的取值即其名字符串,用裸名匹配运行时送达的通知。
-    zdShutdownObserverRestart = [nc addObserverForName:@"NSWorkspaceWillRestartNotification"
-                                                 object:nil queue:nil
-                                             usingBlock:^(NSNotification *note) {
-        zdAppOnSystemShutdown();
-    }];
-    [zdShutdownObserverRestart retain];
-}
-
 void zdFloatSetVisibleC(int on) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (zdFloatPanel == nil) { return; }
@@ -257,17 +262,5 @@ void zdFloatCloseC(void) {
         if (zdFloatPanel != nil) {
             [zdFloatPanel orderOut:nil];
         }
-    });
-}
-
-// zdAppSetActivationPolicyC 切换应用激活策略:regular=1 显示 Dock 图标,
-// regular=0 切到 Accessory(无 Dock 图标、不出现在应用切换器,窗口/面板/托盘照常)。
-// 异步派发主线程,按调用顺序生效——hideToTray 先 orderOut 再切 Accessory,
-// showToScreen 先切 Regular 再上屏,窗口成 key 之前图标已就位。
-void zdAppSetActivationPolicyC(int regular) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [NSApp setActivationPolicy:regular
-            ? NSApplicationActivationPolicyRegular
-            : NSApplicationActivationPolicyAccessory];
     });
 }

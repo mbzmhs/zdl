@@ -13,3 +13,6 @@ func Close() {}
 
 // Notify 在非 Windows 平台为空操作。
 func Notify(title, text string) {}
+
+// SetMenuTheme 非 Windows 占位:菜单明暗跟随仅 Windows(Win10 1809+ uxtheme)实现。
+func SetMenuTheme(dark bool) {}

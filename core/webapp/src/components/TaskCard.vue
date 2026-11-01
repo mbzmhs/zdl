@@ -105,8 +105,12 @@ const etaText = computed(() => {
 });
 const rightText = computed(() => {
   const t = props.t;
-  return (t.status === "completed" || t.status === "seeding") && t.completedAt && !t.completedAt.startsWith("0001")
-    ? "完成于 " + fmtTime(t.completedAt) : "";
+  // 完成/做种显"完成于";未完成任务同位显"创建于",让每行进度条右上方始终有
+  // 可读时间(对齐 Fyne rightLbl 口径)。零值时间戳序列化为 "0001-...",须排除
+  if ((t.status === "completed" || t.status === "seeding") && t.completedAt && !t.completedAt.startsWith("0001"))
+    return "完成于 " + fmtTime(t.completedAt);
+  if (t.createdAt && !t.createdAt.startsWith("0001")) return "创建于 " + fmtTime(t.createdAt);
+  return "";
 });
 
 /* 进度条:completed/seeding 满格 done;有百分比按数值(失败缀 err);运行中无

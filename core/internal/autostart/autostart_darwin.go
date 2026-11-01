@@ -1,8 +1,9 @@
 //go:build darwin
 
 // Package autostart 的 macOS 实现:写 ~/Library/LaunchAgents/com.zdownloader.plist
-// (LaunchAgent,RunAtLoad 登录即拉起,附 --no-browser 静默常驻,与 Windows 注册表
-// Run 键同语义)。plist 即唯一事实来源,不写 config.json;用户无需管理员权限。
+// (LaunchAgent,RunAtLoad 登录即拉起,裸启动静默常驻——zdl_shell 本就是托盘
+// 组件,不带参数,与 Windows 注册表 Run 键同语义)。plist 即唯一事实来源,
+// 不写 config.json;用户无需管理员权限。
 // 裸二进制(非 .app)同样可用;程序移动/升级后路径漂移由 RefreshSelf 自愈。
 package autostart
 
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -33,13 +35,26 @@ func plistPath() (string, error) {
 	return dir + "/" + agentLabel + ".plist", nil
 }
 
-// commandArgs 启动命令(os.Executable + 静默参数:登录后不开浏览器进托盘)。
+// commandArgs 启动命令:登记目标恒为同目录的 zdl_shell(常驻托盘组件)——
+// 自启开关在窗口设置页触发,调用方是可退出的 zdl_ui,直登 UI 会让登录后
+// 先弹窗口;托盘才是静默常驻的正确入口,窗口由召唤链按需拉起。找不到兄弟
+// 文件时(历史单二进制布局/测试环境)回落到调用方自身,保持旧行为(与
+// autostart_windows.go 的 commandString 同语义)。不带参数:zdl_shell 恒为
+// 常驻托盘,裸启动即其本征形态。
 func commandArgs() ([]string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
-	return []string{exe, "--no-browser"}, nil
+	if shell := filepath.Join(filepath.Dir(exe), "zdl_shell"); fileExists(shell) {
+		exe = shell
+	}
+	return []string{exe}, nil
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 // plistContent 渲染 LaunchAgent plist XML。路径等参数值经 XML 转义。

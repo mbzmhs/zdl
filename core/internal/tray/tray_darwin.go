@@ -69,6 +69,10 @@ func Notify(title, text string) {
 	_ = exec.Command("osascript", "-e", "display notification "+asl(text)+" with title "+asl(title)).Run()
 }
 
+// SetMenuTheme darwin 占位:菜单明暗跟随仅 Windows(Win10 1809+ uxtheme)实现;
+// macOS 菜单栏自动随系统外观。
+func SetMenuTheme(dark bool) {}
+
 // asl 把字符串渲染为 AppleScript 字符串字面量(反斜杠/双引号/换行转义)。
 func asl(s string) string {
 	r := strings.NewReplacer(

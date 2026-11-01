@@ -415,13 +415,29 @@ const upSpeedTxt = computed(() => { void pollTick.value; const h = histNow.value
 
 /* ---------------- 动作 ---------------- */
 async function saveTorrent(task) {
-  // 另存为种子:后端弹原生"另存为"对话框(不走 webview 内置下载),
-  // 返回用户实际保存的路径。用户在对话框点取消时后端返回 "已取消"。
+  // 另存为种子(Wails 壳:取字节走 JS 桥弹原生另存;浏览器:走浏览器原生
+  // 下载,/api/tasks/{id}/torrent 本就带 attachment 响应头)
   try {
-    const r = await fetch(`/api/tasks/${task.id}/save-torrent`, { method: "POST" });
-    const e = await r.json().catch(() => ({}));
-    if (!r.ok) { toast((e && e.error) || "种子尚未就绪(元数据未获取)", "err"); return; }
-    toast(e.path === "已取消" ? "已取消另存" : "已另存种子到 " + e.path, "ok");
+    const app = window.go && window.go.main && window.go.main.App;
+    if (app && app.SaveTorrentDialog) {
+      const r = await fetch(`/api/tasks/${task.id}/torrent`);
+      if (!r.ok) { toast("种子尚未就绪(元数据未获取)", "err"); return; }
+      const buf = new Uint8Array(await r.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < buf.length; i += 0x8000)
+        bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      const p = await app.SaveTorrentDialog(btoa(bin), (task.filename || task.id) + ".torrent");
+      toast(p ? "已另存种子到 " + p : "已取消另存", "ok");
+      return;
+    }
+    const r = await fetch(`/api/tasks/${task.id}/torrent`);
+    if (!r.ok) { toast("种子尚未就绪(元数据未获取)", "err"); return; }
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = (task.filename || task.id) + ".torrent";
+    a.click();
+    URL.revokeObjectURL(a.href);
   } catch (e) { showErr(e); }
 }
 

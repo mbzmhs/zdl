@@ -2,11 +2,12 @@
 
 // Package autostart 以零依赖方式管理「开机自动启动」:
 // 在 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 写入带引号的
-// 程序绝对路径(附 -no-browser,登录后静默常驻托盘)。
+// 程序绝对路径(不带参数,登录后静默常驻托盘;zdl_shell 本就是托盘组件)。
 // 使用 HKCU 无需管理员权限;注册表即唯一事实来源,不写入 config.json。
 package autostart
 
 import (
+	"path/filepath"
 	"fmt"
 	"os"
 	"syscall"
@@ -59,13 +60,26 @@ func openKey(desiredAccess uint32) (syscall.Handle, uintptr) {
 	return h, code
 }
 
-// commandString 返回写入注册表的启动命令(登录后不开浏览器,静默进托盘)。
+// commandString 返回写入注册表的启动命令(登录后静默进常驻组件托盘)。
+// 三件套架构下常驻组件是同目录的 zdl_shell.exe(本调用方 zdl_ui 是可退出
+// 的窗口进程,不该被自启拉起);找不到兄弟文件时(历史单二进制布局/测试
+// 环境)回落到调用方自身,保持旧行为。命令不带任何参数:zdl_shell 恒为常驻
+// 托盘,裸启动即其本征形态(历史上附加 "-tray" 属多余,且 Go 的 flag.Parse
+// 遇未定义参数会 os.Exit(2),使旧注册表值在登录时静默退出、托盘拉不起来)。
 func commandString() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	return `"` + exe + `" -no-browser`, nil
+	if shell := filepath.Join(filepath.Dir(exe), "zdl_shell.exe"); fileExists(shell) {
+		exe = shell
+	}
+	return `"` + exe + `"`, nil
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 // Enabled 报告当前是否已开启开机自启。

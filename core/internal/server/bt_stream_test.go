@@ -6,12 +6,12 @@ import "testing"
 func TestParseRangeHeader(t *testing.T) {
 	const size = 10000
 	cases := []struct {
-		name    string
-		hdr     string
-		start   int64
-		end     int64
-		has     bool
-		ok      bool
+		name  string
+		hdr   string
+		start int64
+		end   int64
+		has   bool
+		ok    bool
 	}{
 		{"无 Range", "", 0, 9999, false, true},
 		{"前缀", "bytes=0-", 0, 9999, true, true},

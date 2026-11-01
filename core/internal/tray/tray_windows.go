@@ -9,6 +9,7 @@ import (
 	"errors"
 	"image/png"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -18,8 +19,10 @@ var (
 	modShell32  = syscall.NewLazyDLL("shell32.dll")
 	modKernel32 = syscall.NewLazyDLL("kernel32.dll")
 	modGdi32    = syscall.NewLazyDLL("gdi32.dll")
+	modUxtheme  = syscall.NewLazyDLL("uxtheme.dll")
 
 	procGetModuleHandleW    = modKernel32.NewProc("GetModuleHandleW")
+	procGetProcAddress      = modKernel32.NewProc("GetProcAddress")
 	procRegisterClassExW    = modUser32.NewProc("RegisterClassExW")
 	procCreateWindowExW     = modUser32.NewProc("CreateWindowExW")
 	procDefWindowProcW      = modUser32.NewProc("DefWindowProcW")
@@ -63,6 +66,16 @@ const (
 	idmOpen         = 1
 	idmSettings     = 2
 	idmExit         = 3
+
+	// uxtheme 菜单明暗应用模式(Win10 1809+ 的导出序号,非具名导出):
+	// SetPreferredAppMode(135) 把进程菜单/弹层的PreferredAppMode 置为
+	// ForceDark/ForceLight(不依赖清单的暗色感知声明,直接覆盖系统 app mode),
+	// FlushMenuThemes(136) 清掉 uxtheme 缓存的菜单主题,使下一次 TrackPopupMenu
+	// 按新模式渲染——Notepad++ 等软件让右键菜单跟随应用主题的同款机制。
+	pamForceDark           = 2
+	pamForceLight          = 3
+	ordSetPreferredAppMode = 135
+	ordFlushMenuThemes     = 136
 )
 
 type wndClassExW struct {
@@ -127,6 +140,10 @@ var (
 	stSettingsFn func()
 	stExitFn     func()
 	stWndProc    uintptr
+
+	stDark           atomic.Bool // 托盘菜单明暗(跟随应用主题;showMenu 时应用)
+	stSetPrefAppMode uintptr     // uxtheme!SetPreferredAppMode(0=旧系统无此序号)
+	stFlushMenuThemes uintptr    // uxtheme!FlushMenuThemes(0=同上)
 )
 
 // Run 启动托盘图标并阻塞在消息循环。
@@ -141,6 +158,11 @@ func Run(iconPNG []byte, tooltip string, open, openSettings, exit func()) error 
 	if hInst == 0 {
 		return errors.New("GetModuleHandleW 失败")
 	}
+
+	// 解析菜单明暗序号函数:旧系统(Win10 1809 前)GetProcAddress 得 0,
+	// applyMenuTheme 静默跳过,菜单回落系统样式(优雅降级)
+	stSetPrefAppMode, _, _ = procGetProcAddress.Call(modUxtheme.Handle(), uintptr(ordSetPreferredAppMode))
+	stFlushMenuThemes, _, _ = procGetProcAddress.Call(modUxtheme.Handle(), uintptr(ordFlushMenuThemes))
 
 	clsName, _ := syscall.UTF16PtrFromString("ZDownloaderTrayWnd")
 	stWndProc = syscall.NewCallback(wndProc)
@@ -215,6 +237,25 @@ func Close() {
 	}
 }
 
+// SetMenuTheme 设定托盘菜单明暗(跟随应用主题,跨 goroutine 可调)。仅写原子
+// 标志;真正的 uxtheme 调用延迟到 showMenu 于托盘线程执行——SetPreferredAppMode/
+// FlushMenuThemes 须在显示菜单的线程上调用才对当次 TrackPopupMenu 生效。
+func SetMenuTheme(dark bool) { stDark.Store(dark) }
+
+// applyMenuTheme 把 uxtheme 菜单应用模式刷成指定明暗,随后的 TrackPopupMenu
+// 即按该模式渲染。序号不存在(Win10 1809 前)时静默跳过,菜单回落系统样式。
+func applyMenuTheme(dark bool) {
+	if stSetPrefAppMode == 0 || stFlushMenuThemes == 0 {
+		return
+	}
+	mode := uintptr(pamForceLight)
+	if dark {
+		mode = uintptr(pamForceDark)
+	}
+	syscall.SyscallN(stSetPrefAppMode, mode)
+	syscall.SyscallN(stFlushMenuThemes)
+}
+
 // Notify 弹出托盘气泡通知(Windows 10+ 呈现为操作中心的系统通知,即使
 // 主窗口最小化/隐藏也可见)。托盘未运行(-no-tray / 尚未启动)时静默跳过;
 // 可从任意 goroutine 调用(Shell_NotifyIcon 自身跨线程安全)。
@@ -260,6 +301,9 @@ func showMenu(hwnd uintptr) {
 	var pt pointW
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 	procSetForegroundWindow.Call(hwnd)
+	// 每次弹出前按当前应用主题刷新菜单应用模式(在托盘线程上调用才对
+	// 本次 TrackPopupMenu 生效;应用内切主题后下一次右键即跟随)
+	applyMenuTheme(stDark.Load())
 	id, _, _ := procTrackPopupMenu.Call(
 		stHMenu, tpmReturnCmd|tpmNonotify|tpmRightButton,
 		uintptr(pt.X), uintptr(pt.Y), 0, hwnd, 0)
